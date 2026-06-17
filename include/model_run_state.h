@@ -1,6 +1,7 @@
 #ifndef BN_MODEL_RUN_STATE_H
 #define BN_MODEL_RUN_STATE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct {
@@ -11,6 +12,8 @@ typedef struct {
     float *logits;                // [vocab_size]
     float *key_cache;             // [n_attn_layers * seq_len * kv_dim]
     float *value_cache;           // [n_attn_layers * seq_len * kv_dim]
+    size_t key_cache_alloc_bytes;
+    size_t value_cache_alloc_bytes;
     int8_t *x_q;                  // [max(dim, hidden_dim)] scratch for int8 quantized x
     float *rope_freq;             // [head_size/2] precomputed RoPE frequencies
     // TurboQuant compressed KV cache (NULL if kv_tq_bits == 0)

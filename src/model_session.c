@@ -4,6 +4,8 @@
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <sys/mman.h>
+#include <string.h>
 
 static int checked_add_size(size_t *acc, size_t add) {
     if (*acc > SIZE_MAX - add) return -1;
@@ -286,8 +288,26 @@ int bn_model_alloc_session_buffers(const BnConfig *c, const BnWeights *w,
     s->hb2         = (float *)sh_arena_calloc(arena, hb2_size, sizeof(float));
     s->att         = (float *)sh_arena_calloc(arena, att_size, sizeof(float));
     s->logits      = (float *)sh_arena_calloc(arena, c->vocab_size, sizeof(float));
-    s->key_cache   = (float *)sh_arena_calloc(arena, kv_cache_size, kv_elem_size);
-    s->value_cache = (float *)sh_arena_calloc(arena, kv_cache_size, kv_elem_size);
+    {
+        size_t kv_total_bytes = 0;
+        if (checked_mul_size(kv_cache_size, kv_elem_size, &kv_total_bytes) != 0)
+            return -1;
+        s->key_cache_alloc_bytes = kv_total_bytes;
+        s->value_cache_alloc_bytes = kv_total_bytes;
+        s->key_cache = (float *)mmap(NULL, kv_total_bytes,
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_ANON | MAP_PRIVATE, -1, 0);
+        s->value_cache = (float *)mmap(NULL, kv_total_bytes,
+                                       PROT_READ | PROT_WRITE,
+                                       MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (s->key_cache == MAP_FAILED || s->value_cache == MAP_FAILED) {
+            if (s->key_cache != MAP_FAILED) munmap(s->key_cache, kv_total_bytes);
+            if (s->value_cache != MAP_FAILED) munmap(s->value_cache, kv_total_bytes);
+            s->key_cache = NULL; s->value_cache = NULL;
+            s->key_cache_alloc_bytes = 0; s->value_cache_alloc_bytes = 0;
+            return -1;
+        }
+    }
     s->x_q         = (int8_t *)sh_arena_calloc(arena, x_q_size, sizeof(int8_t));
     s->rope_freq   = (float *)sh_arena_alloc(arena, half_head * sizeof(float));
 
