@@ -160,6 +160,8 @@ int bn_tokenizer_init(BnTokenizer *t, BnGGUFFile *f) {
     t->im_end_id   = vocab_lookup(t, "<|im_end|>");
     t->chatml = (t->im_start_id >= 0 && t->im_end_id >= 0) ? 1 : 0;
 
+    t->endoftext_id = vocab_lookup(t, "<|endoftext|>");
+
     return 0;
 }
 

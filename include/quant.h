@@ -176,8 +176,8 @@ typedef struct {
     uint8_t  qs[BN_QK_K / 4];      // 64 bytes: 8-bit grid indices
     uint8_t  qh[BN_QK_K / 32];     //  8 bytes: high bits for 9-bit grid indices
     uint8_t  signs[BN_QK_K / 8];   // 32 bytes: sign bits (1 per element)
-    uint8_t  scales[BN_QK_K / 32]; //  8 bytes: 4-bit sub-block scales (nibble-packed)
-} BnBlockIQ3S;                      // 114 bytes total
+    uint8_t  scales[BN_QK_K / 64]; //  4 bytes: 4-bit sub-block scales (nibble-packed)
+} BnBlockIQ3S;                      // 110 bytes total
 
 // IQ2_XXS: 2-bit codebook quantization, 256 elements per block
 typedef struct {

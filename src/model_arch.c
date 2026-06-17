@@ -220,7 +220,7 @@ static int bn_model_arch_match_qwen(const char *arch) {
 }
 
 static int bn_model_arch_match_qwen3(const char *arch) {
-    return arch && strcmp(arch, "qwen3") == 0;
+    return arch && strncmp(arch, "qwen3", 5) == 0;
 }
 
 static int bn_model_arch_match_bitnet(const char *arch) {

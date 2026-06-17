@@ -12,6 +12,7 @@ typedef struct {
     int     vocab_size;
     int     bos_id, eos_id, eot_id;
     int     im_start_id, im_end_id; // ChatML tokens (-1 if absent)
+    int     endoftext_id;
     int     add_bos;                // whether to prepend BOS (from GGUF metadata)
     int     chatml;                 // 1 if model uses ChatML template
     int     metaspace;              // 1 for tokenizers that encode spaces as U+2581
