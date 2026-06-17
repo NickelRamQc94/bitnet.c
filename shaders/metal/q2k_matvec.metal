@@ -35,15 +35,18 @@ kernel void q2k_matvec(device const uchar *weights [[buffer(0)]],
             uint elem_base = bi * 256;
             uint my_start = local_elem * ELEMS_PER_THREAD;
             for (uint i = 0; i < ELEMS_PER_THREAD; i++) {
-                uint elem = my_start + i;
-                uint group = elem / 16;
-                uint in_group = elem % 16;
-                uchar sc_byte = scales[group];
-                float sc = d * float(sc_byte & 0xF);
+                uint elem    = my_start + i;
+                uint hp      = elem >> 7;
+                uint j       = (elem >> 5) & 3u;
+                uint sub     = (elem >> 4) & 1u;
+                uint l16     = elem & 0xFu;
+                uint byte_idx = hp * 32 + sub * 16 + l16;
+                uint shift = j * 2;
+                uchar sc_byte = scales[elem >> 4];
+                float sc = d    * float(sc_byte & 0xFu);
                 float mn = dmin * float(sc_byte >> 4);
-                uchar qbyte = qs[elem / 4];
-                uint shift = (elem % 4) * 2;
-                uint q2 = (qbyte >> shift) & 3;
+                uchar qbyte = qs[byte_idx];
+                uint q2 = (qbyte >> shift) & 3u;
                 acc += (sc * float(q2) - mn) * x[x_base + elem_base + elem];
             }
         }

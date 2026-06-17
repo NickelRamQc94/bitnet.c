@@ -1,22 +1,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
+
 constant uint TILE_ROWS = 32;
 constant uint THREADS_PER_ROW = 8;
-constant uint ELEMS_PER_THREAD = 256 / THREADS_PER_ROW;
 constant uint BLOCK_BYTES = 110;
 
 static inline int unpack_q3k_scale(uint j, device const uchar *scales) {
-    uint idx = j / 2;
-    int raw;
-    if (j < 8) {
-        raw = int(((j % 2 == 0) ? scales[idx] : (scales[idx] >> 4)) & 0xF);
-    } else {
-        uint lo = ((j % 2 == 0) ? scales[idx] : (scales[idx] >> 4)) & 0xF;
-        uint hi = (scales[8 + (j - 8)] >> ((j % 2) * 4)) & 3;
-        raw = int(lo | (hi << 4));
-    }
-    return raw - 32;
+    uint lo = (scales[j & 7] >> ((j >> 3) * 4)) & 0xFu;
+    uint hi = (scales[8 + (j & 3)] >> ((j >> 2) * 2)) & 0x3u;
+    return (int)(lo | (hi << 4)) - 32;
 }
 
 kernel void q3k_matvec(device const uchar *weights [[buffer(0)]],
@@ -41,27 +34,37 @@ kernel void q3k_matvec(device const uchar *weights [[buffer(0)]],
         uint row_byte = global_row * n_blocks * BLOCK_BYTES;
         for (uint bi = 0; bi < n_blocks; bi++) {
             device const uchar *block = weights + row_byte + bi * BLOCK_BYTES;
-            device const uchar *hmask = block;
-            device const uchar *qs = block + 32;
+            device const uchar *hmask  = block;
+            device const uchar *qs     = block + 32;
             device const uchar *scales = block + 96;
             float d = float(*(device const half *)(block + 108));
-            uint elem_base = bi * 256;
-            uint my_start = local_elem * ELEMS_PER_THREAD;
-            for (uint i = 0; i < ELEMS_PER_THREAD; i++) {
-                uint elem = my_start + i;
-                uchar qbyte = qs[elem / 4];
-                uint shift = (elem % 4) * 2;
-                uint lo2 = (qbyte >> shift) & 3;
-                uint hi = (hmask[elem / 8] >> (elem % 8)) & 1;
-                int q3 = int(lo2 | (hi << 2)) - 4;
-                uint group = elem / 16;
-                int sc = unpack_q3k_scale(group, scales);
-                acc += d * float(sc) * float(q3) * x[x_base + elem_base + elem];
+
+            uint j_outer = local_elem;
+            uint n_sel   = (j_outer >> 2) & 1u;
+            uint j       = j_outer & 3u;
+            uint shift   = j * 2;
+            uint q_off   = n_sel * 32;
+            uint hm_bit  = j_outer;
+            uint elem_base_in_block = n_sel * 128 + j * 32;
+
+            float dl0 = d * float(unpack_q3k_scale(2 * j_outer + 0, scales));
+            float dl1 = d * float(unpack_q3k_scale(2 * j_outer + 1, scales));
+
+            for (uint l = 0; l < 16; l++) {
+                int q3 = (int)((qs[q_off + l] >> shift) & 3) -
+                         ((hmask[l] & (1u << hm_bit)) ? 0 : 4);
+                acc += dl0 * float(q3) *
+                       x[x_base + bi * 256 + elem_base_in_block + l];
+            }
+            for (uint l = 0; l < 16; l++) {
+                int q3 = (int)((qs[q_off + 16 + l] >> shift) & 3) -
+                         ((hmask[16 + l] & (1u << hm_bit)) ? 0 : 4);
+                acc += dl1 * float(q3) *
+                       x[x_base + bi * 256 + elem_base_in_block + 16 + l];
             }
         }
     }
 
-    // Simdgroup reduction for 8 threads per row (no barriers needed)
     float val = acc;
     val += simd_shuffle_xor(val, 4);
     val += simd_shuffle_xor(val, 2);

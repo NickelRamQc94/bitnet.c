@@ -404,28 +404,19 @@ void bn_quant_dequant_iq3s(const BnBlockIQ3S *block, float *out) {
 
 void bn_quant_dequant_iq2xxs(const BnBlockIQ2XXS *block, float *out) {
     float d = bn_fp16_to_fp32(block->d);
-    const uint16_t *q = block->qs;
-
-    for (int ib32 = 0; ib32 < BN_QK_K / 32; ib32 += 2) {
-        const uint32_t *q32 = (const uint32_t *)q;
-        float db1 = d * (0.5f + (q32[1] >> 28));
-        float db2 = d * (0.5f + (q32[3] >> 28));
-
+    for (int ib32 = 0; ib32 < BN_QK_K / 32; ib32++) {
+        uint32_t aux32[2];
+        memcpy(aux32, block->qs + 4 * ib32, 8);
+        const uint8_t *aux8 = (const uint8_t *)aux32;
+        float db = d * (0.5f + (float)(aux32[1] >> 28)) * 0.25f;
         for (int l = 0; l < 4; l++) {
-            const uint8_t *grid  = (const uint8_t *)&bn_iq2xxs_grid[q32[l] & 0xFF];
-            const uint8_t *grid2 = (const uint8_t *)&bn_iq2xxs_grid[(q32[l] >> 8) & 0xFF];
-            uint8_t signs = bn_ksigns_iq2xs[(q32[l] >> 16) & 127];
-            float db = l < 2 ? db1 : db2;
-
+            const uint8_t *grid = (const uint8_t *)&bn_iq2xxs_grid[aux8[l]];
+            uint8_t signs = bn_ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
             for (int j = 0; j < 8; j++) {
-                *out++ = db * grid[j] * (1 - 2 * (int)(signs & 1));
-                signs >>= 1;
-            }
-            for (int j = 0; j < 8; j++) {
-                *out++ = db * grid2[j];
+                *out++ = db * grid[j] *
+                         ((signs & (1u << j)) ? -1.0f : 1.0f);
             }
         }
-        q += 8;  // advance 16 bytes = 8 uint16_t
     }
 }
 
@@ -460,20 +451,18 @@ void bn_quant_dequant_iq2xs(const BnBlockIQ2XS *block, float *out) {
 
 void bn_quant_dequant_iq2s(const BnBlockIQ2S *block, float *out) {
     float d = bn_fp16_to_fp32(block->d);
-
     for (int ib32 = 0; ib32 < BN_QK_K / 32; ib32++) {
-        uint8_t sc_byte = block->scales[ib32 / 2];
-        int sc_nib = (sc_byte >> ((ib32 & 1) * 4)) & 0xF;
-        float db = d * (1 + 2 * sc_nib);
-
+        float db[2];
+        db[0] = d * (0.5f + (block->scales[ib32] & 0xf)) * 0.25f;
+        db[1] = d * (0.5f + (block->scales[ib32] >>  4)) * 0.25f;
         for (int l = 0; l < 4; l++) {
+            float dl = db[l / 2];
             int grid_idx = block->qs[4 * ib32 + l] |
-                           (((block->qh[ib32] >> (2 * l)) & 3) << 8);
+                           ((((int)block->qh[ib32] << (8 - 2 * l)) & 0x300));
             const uint8_t *grid = (const uint8_t *)&bn_iq2s_grid[grid_idx];
             uint8_t signs = block->qs[BN_QK_K / 8 + 4 * ib32 + l];
-
             for (int j = 0; j < 8; j++) {
-                *out++ = db * grid[j] * (1 - 2 * (int)((signs >> j) & 1));
+                *out++ = dl * grid[j] * (1 - 2 * (int)((signs >> j) & 1));
             }
         }
     }

@@ -3,7 +3,7 @@ using namespace metal;
 
 constant uint TILE_ROWS = 32;
 constant uint THREADS_PER_ROW = 8;
-constant uint ELEMS_PER_THREAD = 32 / THREADS_PER_ROW;
+constant uint BYTES_PER_THREAD = 16 / THREADS_PER_ROW;
 
 kernel void q4_1_matvec(device const uchar *weights [[buffer(0)]],
                         device const float *x       [[buffer(1)]],
@@ -31,12 +31,14 @@ kernel void q4_1_matvec(device const uchar *weights [[buffer(0)]],
             float m = float(*(device const half *)(block + 2));
             device const uchar *qs = block + 4;
             uint elem_base = b * 32;
-            uint my_start = local_elem * ELEMS_PER_THREAD;
-            for (uint i = 0; i < ELEMS_PER_THREAD; i++) {
-                uint elem = my_start + i;
-                uchar qbyte = qs[elem / 2];
-                uint nibble = (elem % 2 == 0) ? (qbyte & 0xF) : (qbyte >> 4);
-                acc += (d * float(nibble) + m) * x[x_base + elem_base + elem];
+            uint my_byte_start = local_elem * BYTES_PER_THREAD;
+            for (uint i = 0; i < BYTES_PER_THREAD; i++) {
+                uint byte_i = my_byte_start + i;
+                uchar q = qs[byte_i];
+                uint lo = q & 0xFu;
+                uint hi = q >> 4;
+                acc += (d * float(lo) + m) * x[x_base + elem_base + byte_i];
+                acc += (d * float(hi) + m) * x[x_base + elem_base + byte_i + 16];
             }
         }
     }

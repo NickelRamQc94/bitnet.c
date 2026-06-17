@@ -23,6 +23,40 @@ static inline uint2 get_scale_min(uint j, device const uchar *scales) {
     return uint2(sc, m);
 }
 
+static inline float q4k_row_dot(device const uchar *weights,
+                                uint row_byte,
+                                uint n_blocks,
+                                device const float *x,
+                                uint my_start,
+                                uint sub,
+                                uint q_off_base,
+                                uint is_high) {
+    float acc = 0.0f;
+    for (uint bi = 0; bi < n_blocks; bi++) {
+        device const uchar *block = weights + row_byte + bi * BLOCK_BYTES;
+        float d    = float(*(device const half *)(block));
+        float dmin = float(*(device const half *)(block + 2));
+        device const uchar *scales = block + 4;
+        device const uchar *qs = block + 16;
+        uint elem_base = bi * QK_K;
+
+        uint2 sm = get_scale_min(sub, scales);
+        device const uchar *q_off = qs + q_off_base;
+
+        float sum_qx = 0.0f;
+        float sum_x = 0.0f;
+        for (uint i = 0; i < 32; i++) {
+            float xv = x[elem_base + my_start + i];
+            uint qbyte = q_off[i];
+            float qval = is_high == 0 ? float(qbyte & 0xF) : float(qbyte >> 4);
+            sum_qx += qval * xv;
+            sum_x += xv;
+        }
+        acc += d * float(sm.x) * sum_qx - dmin * float(sm.y) * sum_x;
+    }
+    return acc;
+}
+
 kernel void q4k_matvec_split(device const uchar *weights [[buffer(0)]],
                              device const float *x       [[buffer(1)]],
                              device float       *out0    [[buffer(2)]],
@@ -31,6 +65,7 @@ kernel void q4k_matvec_split(device const uchar *weights [[buffer(0)]],
                              uint3 wid [[threadgroup_position_in_grid]],
                              uint3 lid [[thread_position_in_threadgroup]]) {
     uint rows = p[0], cols = p[1], split = p[2];
+    uint fused = p[3];
     uint tile_start = wid.x * TILE_ROWS;
     uint tid = lid.x;
 
@@ -47,29 +82,16 @@ kernel void q4k_matvec_split(device const uchar *weights [[buffer(0)]],
     uint q_off_base = group * 32;
 
     float acc = 0.0f;
+    float acc2 = 0.0f;
     if (global_row < rows) {
-        for (uint bi = 0; bi < n_blocks; bi++) {
-            device const uchar *block = weights + row_byte + bi * BLOCK_BYTES;
-            float d    = float(*(device const half *)(block));
-            float dmin = float(*(device const half *)(block + 2));
-            device const uchar *scales = block + 4;
-            device const uchar *qs = block + 16;
-            uint elem_base = bi * QK_K;
-
-            uint2 sm = get_scale_min(sub, scales);
-            device const uchar *q_off = qs + q_off_base;
-
-            float sum_qx = 0.0f;
-            float sum_x = 0.0f;
-            for (uint i = 0; i < 32; i++) {
-                float xv = x[elem_base + my_start + i];
-                uint qbyte = q_off[i];
-                float qval = is_high == 0 ? float(qbyte & 0xF) : float(qbyte >> 4);
-                sum_qx += qval * xv;
-                sum_x += xv;
-            }
-            acc += d * float(sm.x) * sum_qx - dmin * float(sm.y) * sum_x;
-        }
+        acc = q4k_row_dot(weights, row_byte, n_blocks, x, my_start,
+                          sub, q_off_base, is_high);
+    }
+    if (fused != 0u && global_row < split) {
+        uint up_row = global_row + split;
+        uint up_row_byte = up_row * n_blocks * BLOCK_BYTES;
+        acc2 = q4k_row_dot(weights, up_row_byte, n_blocks, x, my_start,
+                           sub, q_off_base, is_high);
     }
 
     float val = acc;
@@ -77,10 +99,19 @@ kernel void q4k_matvec_split(device const uchar *weights [[buffer(0)]],
     val += simd_shuffle_xor(val, 2);
     val += simd_shuffle_xor(val, 1);
 
+    float val2 = acc2;
+    val2 += simd_shuffle_xor(val2, 4);
+    val2 += simd_shuffle_xor(val2, 2);
+    val2 += simd_shuffle_xor(val2, 1);
+
     if (local_elem == 0 && global_row < rows) {
-        if (global_row >= split)
+        if (fused != 0u) {
+            if (global_row < split)
+                out0[global_row] = (val / (1.0f + exp(-val))) * val2;
+        } else if (global_row >= split) {
             out1[global_row - split] = val;
-        else
+        } else {
             out0[global_row] = val;
+        }
     }
 }
