@@ -47,6 +47,45 @@ typedef struct {
     id<MTLComputePipelineState> q4_q8_gateup_pipeline;
     id<MTLComputePipelineState> cpu_order_rmsnorm_pipeline;
     id<MTLComputePipelineState> q6_q8k_matvec_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_rmsnorm_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_conv_silu_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_l2norm_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_alpha_beta_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_delta_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_delta_precise_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_delta_fused_ab_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_delta_fused_full_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_gate_pipeline;
+    id<MTLComputePipelineState> ssm_prefill_silu_gate_stacked_pipeline;
+    id<MTLComputePipelineState> q4k_mul_mm_pipeline;
+    id<MTLComputePipelineState> q5k_mul_mm_pipeline;
+    id<MTLComputePipelineState> q6k_mul_mm_pipeline;
+    id<MTLComputePipelineState> q8_0_mul_mm_pipeline;
+    id<MTLComputePipelineState> q4_0_mul_mm_pipeline;
+    id<MTLComputePipelineState> q4_1_mul_mm_pipeline;
+    id<MTLComputePipelineState> q3k_mul_mm_pipeline;
+    id<MTLComputePipelineState> q2k_mul_mm_pipeline;
+    id<MTLComputePipelineState> f16_mul_mm_pipeline;
+    id<MTLComputePipelineState> bf16_mul_mm_pipeline;
+    id<MTLComputePipelineState> iq4_nl_mul_mm_pipeline;
+    id<MTLComputePipelineState> iq4_xs_mul_mm_pipeline;
+    id<MTLComputePipelineState> iq3_xxs_mul_mm_pipeline;
+    id<MTLComputePipelineState> iq3_s_mul_mm_pipeline;
+    id<MTLComputePipelineState> iq2_s_mul_mm_pipeline;
+    id<MTLComputePipelineState> iq2_xxs_mul_mm_pipeline;
+    int  q4k_mul_mm_spec_K[16];
+    bool q4k_mul_mm_spec_bc_out[16];
+    id<MTLComputePipelineState> q4k_mul_mm_spec_pipeline[16];
+    int  q5k_mul_mm_spec_K[16];
+    bool q5k_mul_mm_spec_bc_out[16];
+    id<MTLComputePipelineState> q5k_mul_mm_spec_pipeline[16];
+    int  q6k_mul_mm_spec_K[16];
+    bool q6k_mul_mm_spec_bc_out[16];
+    id<MTLComputePipelineState> q6k_mul_mm_spec_pipeline[16];
+    id<MTLComputePipelineState> prefill_attn_pipeline;
+    id<MTLComputePipelineState> prefill_attn_pipeline_6144;
+    id<MTLComputePipelineState> prefill_kv_prep_pipeline;
+    int ssm_prefill_enabled;
     int q4_q8_enabled;
     int q8_barriers_enabled;
     int cpu_order_rmsnorm_enabled;
@@ -66,6 +105,21 @@ typedef struct {
     size_t        q8_scales_buf_size;
     id<MTLBuffer> q8_bsums_buf;
     size_t        q8_bsums_buf_size;
+    id<MTLBuffer> ssm_prefill_buf;
+    size_t        ssm_prefill_buf_size;
+    id<MTLBuffer>                  batch_act_buf[2];
+    size_t                         batch_act_buf_size[2];
+    int                            batch_chain_index;
+    int                            batch_active;
+    id<MTLCommandBuffer>           batch_cmd;
+    id<MTLComputeCommandEncoder>   batch_enc;
+    id<MTLFence>                   batch_fence;
+    id<MTLBuffer>                  gpu_key_cache;
+    id<MTLBuffer>                  gpu_value_cache;
+    size_t                         gpu_kv_cache_bytes;
+    int                            gpu_kv_n_layers;
+    int                            gpu_kv_seq_len;
+    int                            gpu_kv_dim;
     /* Shader directory path */
     char shader_dir[256];
 
@@ -286,6 +340,56 @@ static id<MTLComputePipelineState> compile_shader(BnMetalCtx *ctx,
                                                                                 error:&err];
     if (!pso) {
         fprintf(stderr, "[bn:gpu:metal] pipeline error (%s): %s\n",
+                filename, [[err localizedDescription] UTF8String]);
+    }
+    return pso;
+}
+
+static id<MTLComputePipelineState>
+compile_shader_with_fc(BnMetalCtx *ctx, const char *dir,
+                       const char *filename, const char *fn_name,
+                       MTLFunctionConstantValues *fc)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, filename);
+    NSString *nsPath = [NSString stringWithUTF8String:path];
+    NSError *err = nil;
+    NSString *source = [NSString stringWithContentsOfFile:nsPath
+                                                 encoding:NSUTF8StringEncoding
+                                                    error:&err];
+    if (!source) return nil;
+
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    if (@available(macOS 15.0, *)) {
+        opts.mathMode = MTLMathModeFast;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        opts.fastMathEnabled = YES;
+#pragma clang diagnostic pop
+    }
+    opts.languageVersion = MTLLanguageVersion3_0;
+
+    id<MTLLibrary> lib = [ctx->device newLibraryWithSource:source
+                                                   options:opts
+                                                     error:&err];
+    if (!lib) return nil;
+
+    NSString *fnName = [NSString stringWithUTF8String:fn_name];
+    id<MTLFunction> fn = [lib newFunctionWithName:fnName
+                                   constantValues:fc
+                                            error:&err];
+    if (!fn) {
+        fprintf(stderr, "[bn:gpu:metal] FC function '%s' not found in %s: %s\n",
+                fn_name, filename,
+                err ? [[err localizedDescription] UTF8String] : "(no err)");
+        return nil;
+    }
+
+    id<MTLComputePipelineState> pso =
+        [ctx->device newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso) {
+        fprintf(stderr, "[bn:gpu:metal] FC pipeline error (%s): %s\n",
                 filename, [[err localizedDescription] UTF8String]);
     }
     return pso;
@@ -865,7 +969,6 @@ static int metal_init_activations(void *vctx, const void *config_ptr)
         ctx->act_sizes[i] = aligned;
     }
 
-    /* Upload precomputed RoPE frequencies */
     {
         int rope_dims = c->rope_dim_count > 0 ? c->rope_dim_count : c->head_size;
         int half = rope_dims / 2;
@@ -873,6 +976,11 @@ static int metal_init_activations(void *vctx, const void *config_ptr)
         if (!freq) return -1;
         for (int i = 0; i < half; i++)
             freq[i] = 1.0f / powf(c->rope_theta, (float)(2 * i) / (float)rope_dims);
+        if (c->rope_text_dims > 0) {
+            int text_pairs = c->rope_text_dims / 2;
+            for (int i = text_pairs; i < half; i++)
+                freq[i] = 0.0f;
+        }
         memcpy([ctx->act_bufs[BN_GPU_BUF_ROPE_FREQ] contents], freq,
                (size_t)half * sizeof(float));
         free(freq);
@@ -906,6 +1014,7 @@ static int metal_init_activations(void *vctx, const void *config_ptr)
         { BN_GPU_SHADER_FUSED_GATEUP_SILU,"q4_fused_gateup_silu.metal","q4_fused_gateup_silu"},
         { BN_GPU_SHADER_SSM_ALPHA_BETA_SPLIT, "ssm_alpha_beta_split.metal", "ssm_alpha_beta_split" },
         { BN_GPU_SHADER_Q4K_MATVEC_SPLIT, "q4k_matvec_split.metal", "q4k_matvec_split" },
+        { BN_GPU_SHADER_Q5K_MATVEC_SPLIT, "q5k_matvec_split.metal", "q5k_matvec_split" },
     };
     int n_fwd = (int)(sizeof(fwd_shaders) / sizeof(fwd_shaders[0]));
     int compiled = 0;
@@ -924,6 +1033,151 @@ static int metal_init_activations(void *vctx, const void *config_ptr)
         ctx, ctx->shader_dir, "rmsnorm_cpu_order.metal",
         "rmsnorm_cpu_order");
 
+    ctx->ssm_prefill_rmsnorm_pipeline = compile_shader(
+        ctx, ctx->shader_dir, "ssm_prefill_rmsnorm.metal",
+        "ssm_prefill_rmsnorm");
+    ctx->ssm_prefill_conv_silu_pipeline = compile_shader(
+        ctx, ctx->shader_dir, "ssm_prefill_conv_silu.metal",
+        "ssm_prefill_conv_silu");
+    ctx->ssm_prefill_l2norm_pipeline = compile_shader(
+        ctx, ctx->shader_dir, "ssm_prefill_l2norm.metal",
+        "ssm_prefill_l2norm");
+    ctx->ssm_prefill_alpha_beta_pipeline = compile_shader(
+        ctx, ctx->shader_dir, "ssm_prefill_alpha_beta.metal",
+        "ssm_prefill_alpha_beta");
+    {
+        MTLFunctionConstantValues *fc_off =
+            [[MTLFunctionConstantValues alloc] init];
+        ctx->ssm_prefill_delta_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "ssm_prefill_delta.metal",
+            "ssm_prefill_delta", fc_off);
+        MTLFunctionConstantValues *fc_on =
+            [[MTLFunctionConstantValues alloc] init];
+        bool fuse_ab = true;
+        [fc_on setConstantValue:&fuse_ab type:MTLDataTypeBool atIndex:0];
+        ctx->ssm_prefill_delta_fused_ab_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "ssm_prefill_delta.metal",
+            "ssm_prefill_delta", fc_on);
+        MTLFunctionConstantValues *fc_full =
+            [[MTLFunctionConstantValues alloc] init];
+        bool fuse_ab_full = true;
+        bool fuse_l2 = true;
+        [fc_full setConstantValue:&fuse_ab_full type:MTLDataTypeBool atIndex:0];
+        [fc_full setConstantValue:&fuse_l2      type:MTLDataTypeBool atIndex:1];
+        ctx->ssm_prefill_delta_fused_full_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "ssm_prefill_delta.metal",
+            "ssm_prefill_delta", fc_full);
+    }
+    ctx->ssm_prefill_delta_precise_pipeline = compile_shader(
+        ctx, ctx->shader_dir, "ssm_prefill_delta_precise.metal",
+        "ssm_prefill_delta_precise");
+    ctx->ssm_prefill_gate_pipeline = compile_shader(
+        ctx, ctx->shader_dir, "ssm_prefill_gate.metal",
+        "ssm_prefill_gate");
+    ctx->ssm_prefill_silu_gate_stacked_pipeline = compile_shader(
+        ctx, ctx->shader_dir, "ssm_prefill_silu_gate_stacked.metal",
+        "ssm_prefill_silu_gate_stacked");
+    {
+        MTLFunctionConstantValues *empty_fc =
+            [[MTLFunctionConstantValues alloc] init];
+        ctx->q4k_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "q4k_mul_mm.metal", "q4k_mul_mm", empty_fc);
+        ctx->q5k_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "q5k_mul_mm.metal", "q5k_mul_mm", empty_fc);
+        ctx->q6k_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "q6k_mul_mm.metal", "q6k_mul_mm", empty_fc);
+        ctx->q8_0_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "q8_0_mul_mm.metal", "q8_0_mul_mm", empty_fc);
+        ctx->q4_0_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "q4_0_mul_mm.metal", "q4_0_mul_mm", empty_fc);
+        ctx->q4_1_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "q4_1_mul_mm.metal", "q4_1_mul_mm", empty_fc);
+        ctx->q3k_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "q3k_mul_mm.metal", "q3k_mul_mm", empty_fc);
+        ctx->q2k_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "q2k_mul_mm.metal", "q2k_mul_mm", empty_fc);
+        ctx->f16_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "f16_mul_mm.metal", "f16_mul_mm", empty_fc);
+        ctx->bf16_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "bf16_mul_mm.metal", "bf16_mul_mm", empty_fc);
+        ctx->iq4_nl_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "iq4_nl_mul_mm.metal", "iq4_nl_mul_mm", empty_fc);
+        ctx->iq4_xs_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "iq4_xs_mul_mm.metal", "iq4_xs_mul_mm", empty_fc);
+        ctx->iq3_xxs_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "iq3_xxs_mul_mm.metal", "iq3_xxs_mul_mm", empty_fc);
+        ctx->iq3_s_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "iq3_s_mul_mm.metal", "iq3_s_mul_mm", empty_fc);
+        ctx->iq2_s_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "iq2_s_mul_mm.metal", "iq2_s_mul_mm", empty_fc);
+        ctx->iq2_xxs_mul_mm_pipeline = compile_shader_with_fc(
+            ctx, ctx->shader_dir, "iq2_xxs_mul_mm.metal", "iq2_xxs_mul_mm", empty_fc);
+    }
+    int n_fc_q4 = 0, n_fc_q5 = 0, n_fc_q6 = 0;
+    {
+        const int common_K[] = { 1024, 2048, 3584, 5504 };
+        const bool bc_in = false;
+        for (int i = 0; i < (int)(sizeof(common_K) / sizeof(common_K[0])); i++) {
+            int K = common_K[i];
+            for (int bo = 0; bo < 2; bo++) {
+                bool bc_out_val = (bo != 0);
+                MTLFunctionConstantValues *fc =
+                    [[MTLFunctionConstantValues alloc] init];
+                [fc setConstantValue:&K     type:MTLDataTypeInt  atIndex:0];
+                [fc setConstantValue:&bc_in type:MTLDataTypeBool atIndex:1];
+                [fc setConstantValue:&bc_out_val type:MTLDataTypeBool atIndex:2];
+                id<MTLComputePipelineState> q4_pso = compile_shader_with_fc(
+                    ctx, ctx->shader_dir, "q4k_mul_mm.metal", "q4k_mul_mm", fc);
+                if (q4_pso) {
+                    ctx->q4k_mul_mm_spec_K[n_fc_q4] = K;
+                    ctx->q4k_mul_mm_spec_bc_out[n_fc_q4] = bc_out_val;
+                    ctx->q4k_mul_mm_spec_pipeline[n_fc_q4] = q4_pso;
+                    n_fc_q4++;
+                }
+                id<MTLComputePipelineState> q5_pso = compile_shader_with_fc(
+                    ctx, ctx->shader_dir, "q5k_mul_mm.metal", "q5k_mul_mm", fc);
+                if (q5_pso) {
+                    ctx->q5k_mul_mm_spec_K[n_fc_q5] = K;
+                    ctx->q5k_mul_mm_spec_bc_out[n_fc_q5] = bc_out_val;
+                    ctx->q5k_mul_mm_spec_pipeline[n_fc_q5] = q5_pso;
+                    n_fc_q5++;
+                }
+                id<MTLComputePipelineState> q6_pso = compile_shader_with_fc(
+                    ctx, ctx->shader_dir, "q6k_mul_mm.metal", "q6k_mul_mm", fc);
+                if (q6_pso) {
+                    ctx->q6k_mul_mm_spec_K[n_fc_q6] = K;
+                    ctx->q6k_mul_mm_spec_bc_out[n_fc_q6] = bc_out_val;
+                    ctx->q6k_mul_mm_spec_pipeline[n_fc_q6] = q6_pso;
+                    n_fc_q6++;
+                }
+            }
+        }
+    }
+    (void)n_fc_q4; (void)n_fc_q5; (void)n_fc_q6;
+    ctx->prefill_attn_pipeline = compile_shader(
+        ctx, ctx->shader_dir, "prefill_attn.metal", "prefill_attn");
+    ctx->prefill_attn_pipeline_6144 = compile_shader(
+        ctx, ctx->shader_dir, "prefill_attn.metal", "prefill_attn_6144");
+    ctx->prefill_kv_prep_pipeline = compile_shader(
+        ctx, ctx->shader_dir, "prefill_kv_prep.metal", "prefill_kv_prep");
+    ctx->ssm_prefill_enabled = 0;
+    if (ctx->ssm_prefill_rmsnorm_pipeline &&
+        ctx->ssm_prefill_conv_silu_pipeline &&
+        ctx->ssm_prefill_l2norm_pipeline &&
+        ctx->ssm_prefill_alpha_beta_pipeline &&
+        ctx->ssm_prefill_delta_pipeline &&
+        ctx->ssm_prefill_gate_pipeline) {
+        NSUInteger lane_width =
+            [ctx->ssm_prefill_delta_pipeline threadExecutionWidth];
+        if (lane_width == 32) {
+            ctx->ssm_prefill_enabled = 1;
+        } else {
+            fprintf(stderr,
+                    "[bn:gpu:metal] ssm_prefill disabled: simdgroup width=%lu (need 32)\n",
+                    (unsigned long)lane_width);
+        }
+    }
+
     return 0;
 }
 
@@ -937,6 +1191,21 @@ static void metal_free_activations(void *vctx)
     }
     for (int i = 0; i < BN_GPU_SHADER_COUNT; i++)
         ctx->fwd_pipelines[i] = nil;
+    ctx->ssm_prefill_rmsnorm_pipeline    = nil;
+    ctx->ssm_prefill_conv_silu_pipeline  = nil;
+    ctx->ssm_prefill_l2norm_pipeline     = nil;
+    ctx->ssm_prefill_alpha_beta_pipeline = nil;
+    ctx->ssm_prefill_delta_pipeline      = nil;
+    ctx->ssm_prefill_delta_fused_full_pipeline = nil;
+    ctx->ssm_prefill_delta_precise_pipeline = nil;
+    ctx->ssm_prefill_gate_pipeline       = nil;
+    ctx->ssm_prefill_silu_gate_stacked_pipeline = nil;
+    ctx->q4k_mul_mm_pipeline = nil;
+    ctx->q5k_mul_mm_pipeline = nil;
+    ctx->q6k_mul_mm_pipeline = nil;
+    ctx->ssm_prefill_enabled = 0;
+    ctx->ssm_prefill_buf = nil;
+    ctx->ssm_prefill_buf_size = 0;
 }
 
 /* ── Vtable: write/read activation ─────────────────────────────────── */
@@ -1172,6 +1441,122 @@ static int metal_matvec(void *vctx, float *out, void *W_buf, const float *x,
     return 0;
 }
 
+static id<MTLComputePipelineState>
+metal_mul_mm_pipeline_for(BnMetalCtx *ctx, int type,
+                          int rows, int cols, int n_tokens)
+{
+    if (!ctx) return nil;
+    if ((cols % 256) != 0) return nil;
+    if (rows < 64 || n_tokens < 32) return nil;
+    int prefer_fc = 1;
+    bool aligned = ((rows % 64) == 0) && ((n_tokens % 32) == 0);
+    if (type == BN_GGUF_TENSOR_Q4_K && ctx->q4k_mul_mm_pipeline) {
+        if (prefer_fc) {
+            for (int i = 0; i < 16; i++) {
+                if (ctx->q4k_mul_mm_spec_K[i] == cols &&
+                    ctx->q4k_mul_mm_spec_bc_out[i] == !aligned &&
+                    ctx->q4k_mul_mm_spec_pipeline[i])
+                    return ctx->q4k_mul_mm_spec_pipeline[i];
+            }
+        }
+        return ctx->q4k_mul_mm_pipeline;
+    }
+    if (type == BN_GGUF_TENSOR_Q5_K && ctx->q5k_mul_mm_pipeline) {
+        if (prefer_fc) {
+            for (int i = 0; i < 16; i++) {
+                if (ctx->q5k_mul_mm_spec_K[i] == cols &&
+                    ctx->q5k_mul_mm_spec_bc_out[i] == !aligned &&
+                    ctx->q5k_mul_mm_spec_pipeline[i])
+                    return ctx->q5k_mul_mm_spec_pipeline[i];
+            }
+        }
+        return ctx->q5k_mul_mm_pipeline;
+    }
+    if (type == BN_GGUF_TENSOR_Q6_K && ctx->q6k_mul_mm_pipeline) {
+        if (prefer_fc) {
+            for (int i = 0; i < 16; i++) {
+                if (ctx->q6k_mul_mm_spec_K[i] == cols &&
+                    ctx->q6k_mul_mm_spec_bc_out[i] == !aligned &&
+                    ctx->q6k_mul_mm_spec_pipeline[i])
+                    return ctx->q6k_mul_mm_spec_pipeline[i];
+            }
+        }
+        return ctx->q6k_mul_mm_pipeline;
+    }
+    if (type == BN_GGUF_TENSOR_Q8_0   && ctx->q8_0_mul_mm_pipeline)   return ctx->q8_0_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_Q4_0   && ctx->q4_0_mul_mm_pipeline)   return ctx->q4_0_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_Q4_1   && ctx->q4_1_mul_mm_pipeline)   return ctx->q4_1_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_Q3_K   && ctx->q3k_mul_mm_pipeline)    return ctx->q3k_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_Q2_K   && ctx->q2k_mul_mm_pipeline)    return ctx->q2k_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_F16    && ctx->f16_mul_mm_pipeline)    return ctx->f16_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_BF16   && ctx->bf16_mul_mm_pipeline)   return ctx->bf16_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_IQ4_NL && ctx->iq4_nl_mul_mm_pipeline) return ctx->iq4_nl_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_IQ4_XS && ctx->iq4_xs_mul_mm_pipeline) return ctx->iq4_xs_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_IQ3_XXS && ctx->iq3_xxs_mul_mm_pipeline) return ctx->iq3_xxs_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_IQ3_S  && ctx->iq3_s_mul_mm_pipeline)  return ctx->iq3_s_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_IQ2_S  && ctx->iq2_s_mul_mm_pipeline)  return ctx->iq2_s_mul_mm_pipeline;
+    if (type == BN_GGUF_TENSOR_IQ2_XXS && ctx->iq2_xxs_mul_mm_pipeline) return ctx->iq2_xxs_mul_mm_pipeline;
+    return nil;
+}
+
+static void metal_encode_mul_mm(id<MTLComputeCommandEncoder> enc,
+                                 id<MTLComputePipelineState> pipeline,
+                                 id<MTLBuffer> W_buf, size_t W_off,
+                                 id<MTLBuffer> X_buf, size_t X_off,
+                                 id<MTLBuffer> Y_buf, size_t Y_off,
+                                 int rows, int cols, int n_tokens);
+
+static void metal_encode_matmul(BnMetalCtx *ctx,
+                                 id<MTLComputeCommandEncoder> enc,
+                                 BnMetalBuf *wbuf,
+                                 id<MTLBuffer> X_buf, size_t X_off,
+                                 id<MTLBuffer> Y_buf, size_t Y_off,
+                                 int type, int rows, int cols, int n_tokens)
+{
+    id<MTLComputePipelineState> mul_mm =
+        metal_mul_mm_pipeline_for(ctx, type, rows, cols, n_tokens);
+    if (mul_mm && wbuf->bias_offset == 0 && !wbuf->q4_prepared) {
+        metal_encode_mul_mm(enc, mul_mm,
+                             wbuf->buf, wbuf->offset,
+                             X_buf, X_off, Y_buf, Y_off,
+                             rows, cols, n_tokens);
+        return;
+    }
+    uint32_t params[8] = { (uint32_t)rows, (uint32_t)cols,
+                           (uint32_t)n_tokens, 0, 0, 0, 0, 0 };
+    if (wbuf->bias_offset > 0) params[4] = wbuf->bias_offset;
+    uint32_t tile_rows = 32;
+    uint32_t wg_x = ((uint32_t)rows + tile_rows - 1) / tile_rows;
+    [enc setComputePipelineState:ctx->pipelines[type]];
+    [enc setBuffer:wbuf->buf offset:wbuf->offset atIndex:0];
+    [enc setBuffer:X_buf offset:X_off atIndex:1];
+    [enc setBuffer:Y_buf offset:Y_off atIndex:2];
+    [enc setBytes:params length:sizeof(params) atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake(wg_x, (NSUInteger)n_tokens, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+static void metal_encode_mul_mm(id<MTLComputeCommandEncoder> enc,
+                                 id<MTLComputePipelineState> pipeline,
+                                 id<MTLBuffer> W_buf, size_t W_off,
+                                 id<MTLBuffer> X_buf, size_t X_off,
+                                 id<MTLBuffer> Y_buf, size_t Y_off,
+                                 int rows, int cols, int n_tokens)
+{
+    uint32_t params[8] = { (uint32_t)rows, (uint32_t)cols,
+                           (uint32_t)n_tokens, 0, 0, 0, 0, 0 };
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:W_buf offset:W_off atIndex:0];
+    [enc setBuffer:X_buf offset:X_off atIndex:1];
+    [enc setBuffer:Y_buf offset:Y_off atIndex:2];
+    [enc setBytes:params length:sizeof(params) atIndex:3];
+    [enc setThreadgroupMemoryLength:8192 atIndex:0];
+    MTLSize tpg = MTLSizeMake(128, 1, 1);
+    MTLSize grid = MTLSizeMake((NSUInteger)((n_tokens + 31) / 32),
+                                (NSUInteger)((rows + 63) / 64), 1);
+    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tpg];
+}
+
 static int metal_matmul(void *vctx, float *out, void *W_buf, const float *X,
                          int rows, int cols, int n_tokens, int type)
 {
@@ -1187,31 +1572,182 @@ static int metal_matmul(void *vctx, float *out, void *W_buf, const float *X,
 
     memcpy([ctx->x_buf contents], X, x_size);
 
-    uint32_t params[8] = { (uint32_t)rows, (uint32_t)cols, (uint32_t)n_tokens, 0, 0, 0, 0, 0 };
-
-    uint32_t tile_rows = 32;
-    uint32_t wg_x = ((uint32_t)rows + tile_rows - 1) / tile_rows;
+    id<MTLComputePipelineState> mul_mm =
+        metal_mul_mm_pipeline_for(ctx, type, rows, cols, n_tokens);
 
     @autoreleasepool {
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-        [enc setComputePipelineState:ctx->pipelines[type]];
-        [enc setBuffer:wbuf->buf offset:wbuf->offset atIndex:0];
-        [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
-        [enc setBuffer:ctx->out_buf offset:0 atIndex:2];
-        [enc setBytes:params length:sizeof(params) atIndex:3];
+        if (mul_mm) {
+            metal_encode_mul_mm(enc, mul_mm,
+                                 wbuf->buf, wbuf->offset,
+                                 ctx->x_buf, 0,
+                                 ctx->out_buf, 0,
+                                 rows, cols, n_tokens);
+        } else {
+            uint32_t params[8] = { (uint32_t)rows, (uint32_t)cols,
+                                   (uint32_t)n_tokens, 0, 0, 0, 0, 0 };
+            uint32_t tile_rows = 32;
+            uint32_t wg_x = ((uint32_t)rows + tile_rows - 1) / tile_rows;
+            [enc setComputePipelineState:ctx->pipelines[type]];
+            [enc setBuffer:wbuf->buf offset:wbuf->offset atIndex:0];
+            [enc setBuffer:ctx->x_buf offset:0 atIndex:1];
+            [enc setBuffer:ctx->out_buf offset:0 atIndex:2];
+            [enc setBytes:params length:sizeof(params) atIndex:3];
+            MTLSize tpg = MTLSizeMake(256, 1, 1);
+            MTLSize grid = MTLSizeMake(wg_x, n_tokens, 1);
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tpg];
+        }
 
-        MTLSize tpg = MTLSizeMake(256, 1, 1);
-        MTLSize grid = MTLSizeMake(wg_x, n_tokens, 1);
-        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tpg];
         [enc endEncoding];
-
         [cmd commit];
         [cmd waitUntilCompleted];
     }
 
     memcpy(out, [ctx->out_buf contents], out_size);
+    return 0;
+}
+
+static int metal_ensure_ssm_prefill_buf(BnMetalCtx *ctx, size_t bytes);
+
+static int metal_dense_ffn(void *vctx, float *out,
+                           void *gate_buf, void *up_buf, void *down_buf,
+                           const float *x, int dim, int hidden_dim,
+                           int gate_type, int up_type, int down_type,
+                           int act_type)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    BnMetalBuf *gate = (BnMetalBuf *)gate_buf;
+    BnMetalBuf *up   = (BnMetalBuf *)up_buf;
+    BnMetalBuf *down = (BnMetalBuf *)down_buf;
+    if (!ctx || !out || !gate || !up || !down || !x ||
+        dim <= 0 || hidden_dim <= 0 || act_type != 0)
+        return -1;
+    if (gate->q4_prepared || up->q4_prepared || down->q4_prepared) return -1;
+    if (gate_type < 0 || gate_type >= BN_METAL_MAX_TYPES ||
+        up_type   < 0 || up_type   >= BN_METAL_MAX_TYPES ||
+        down_type < 0 || down_type >= BN_METAL_MAX_TYPES ||
+        !ctx->pipelines[gate_type] || !ctx->pipelines[up_type] ||
+        !ctx->pipelines[down_type])
+        return -1;
+    if (!ctx->fwd_pipelines[BN_GPU_SHADER_SILU_GATE]) return -1;
+
+    size_t x_floats        = (size_t)dim;
+    size_t hidden_floats   = (size_t)hidden_dim;
+    size_t gateup_floats   = 2 * hidden_floats;
+    size_t out_floats      = (size_t)dim;
+    size_t total_floats    = x_floats + gateup_floats + out_floats;
+    size_t off_x           = 0;
+    size_t off_gateup      = x_floats;
+    size_t off_out         = off_gateup + gateup_floats;
+
+    if (metal_ensure_ssm_prefill_buf(ctx, total_floats * sizeof(float)) != 0)
+        return -1;
+
+    float *scratch = (float *)[ctx->ssm_prefill_buf contents];
+    memcpy(scratch + off_x, x, x_floats * sizeof(float));
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        metal_encode_matmul(ctx, enc, gate,
+                             ctx->ssm_prefill_buf, off_x * sizeof(float),
+                             ctx->ssm_prefill_buf, off_gateup * sizeof(float),
+                             gate_type, hidden_dim, dim, 1);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        metal_encode_matmul(ctx, enc, up,
+                             ctx->ssm_prefill_buf, off_x * sizeof(float),
+                             ctx->ssm_prefill_buf,
+                             (off_gateup + hidden_floats) * sizeof(float),
+                             up_type, hidden_dim, dim, 1);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        {
+            uint32_t params[8] = { (uint32_t)hidden_dim, 0, 0, 0, 0, 0, 0, 0 };
+            uint32_t wg_x = ((uint32_t)hidden_dim + 255u) / 256u;
+            [enc setComputePipelineState:ctx->fwd_pipelines[BN_GPU_SHADER_SILU_GATE]];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_gateup * sizeof(float) atIndex:0];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:(off_gateup + hidden_floats) * sizeof(float) atIndex:1];
+            [enc setBytes:params length:sizeof(params) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(wg_x, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+
+        metal_encode_matmul(ctx, enc, down,
+                             ctx->ssm_prefill_buf, off_gateup * sizeof(float),
+                             ctx->ssm_prefill_buf, off_out * sizeof(float),
+                             down_type, dim, hidden_dim, 1);
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+
+    memcpy(out, scratch + off_out, out_floats * sizeof(float));
+    return 0;
+}
+
+static int metal_matmul_batch(void *vctx, const BnGPUMatvecOp *ops, int n_ops,
+                              const float *X, int n_tokens, int x_cols)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    if (!ctx || !ops || n_ops <= 0 || !X || n_tokens <= 0 || x_cols <= 0)
+        return -1;
+    if (n_ops > 16) return -1;
+
+    size_t total_out_floats = 0;
+    size_t op_out_offset[16];
+    for (int i = 0; i < n_ops; i++) {
+        const BnGPUMatvecOp *op = &ops[i];
+        BnMetalBuf *wbuf = (BnMetalBuf *)op->W_buf;
+        if (!wbuf || op->rows <= 0 || op->cols != x_cols ||
+            !op->out || op->type < 0 || op->type >= BN_METAL_MAX_TYPES)
+            return -1;
+        if (wbuf->q4_prepared) return -1;
+        if (!ctx->pipelines[op->type]) return -1;
+        op_out_offset[i] = total_out_floats;
+        total_out_floats += (size_t)op->rows * (size_t)n_tokens;
+    }
+
+    size_t x_floats = (size_t)x_cols * (size_t)n_tokens;
+    size_t total_floats = x_floats + total_out_floats;
+    if (metal_ensure_ssm_prefill_buf(ctx, total_floats * sizeof(float)) != 0)
+        return -1;
+
+    float *scratch_base = (float *)[ctx->ssm_prefill_buf contents];
+    memcpy(scratch_base, X, x_floats * sizeof(float));
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        for (int i = 0; i < n_ops; i++) {
+            const BnGPUMatvecOp *op = &ops[i];
+            BnMetalBuf *wbuf = (BnMetalBuf *)op->W_buf;
+            size_t out_off_floats = x_floats + op_out_offset[i];
+            metal_encode_matmul(ctx, enc, wbuf,
+                                 ctx->ssm_prefill_buf, 0,
+                                 ctx->ssm_prefill_buf,
+                                 out_off_floats * sizeof(float),
+                                 op->type, op->rows, op->cols, n_tokens);
+        }
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+
+    for (int i = 0; i < n_ops; i++) {
+        const BnGPUMatvecOp *op = &ops[i];
+        size_t out_off_floats = x_floats + op_out_offset[i];
+        size_t out_bytes = (size_t)op->rows * (size_t)n_tokens * sizeof(float);
+        memcpy(op->out, scratch_base + out_off_floats, out_bytes);
+    }
     return 0;
 }
 
@@ -1306,6 +1842,1098 @@ static int metal_matvec_batch(void *vctx, const BnGPUMatvecOp *ops, int n_ops,
                (size_t)ops[i].rows * sizeof(float));
     }
 
+    return 0;
+}
+
+
+static int metal_kv_cache_init(void *vctx, int n_layers, int seq_len,
+                               int kv_dim)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    if (!ctx || n_layers <= 0 || seq_len <= 0 || kv_dim <= 0) return -1;
+    size_t bytes = (size_t)n_layers * (size_t)seq_len * (size_t)kv_dim *
+                   sizeof(float);
+    if (ctx->gpu_key_cache && ctx->gpu_kv_n_layers == n_layers &&
+        ctx->gpu_kv_seq_len == seq_len && ctx->gpu_kv_dim == kv_dim)
+        return 0;
+    ctx->gpu_key_cache = [ctx->device newBufferWithLength:bytes
+                                                  options:MTLResourceStorageModeShared];
+    ctx->gpu_value_cache = [ctx->device newBufferWithLength:bytes
+                                                    options:MTLResourceStorageModeShared];
+    if (!ctx->gpu_key_cache || !ctx->gpu_value_cache) {
+        ctx->gpu_key_cache = nil;
+        ctx->gpu_value_cache = nil;
+        ctx->gpu_kv_cache_bytes = 0;
+        return -1;
+    }
+    ctx->gpu_kv_cache_bytes = bytes;
+    ctx->gpu_kv_n_layers = n_layers;
+    ctx->gpu_kv_seq_len = seq_len;
+    ctx->gpu_kv_dim = kv_dim;
+    return 0;
+}
+
+static int metal_kv_cache_write(void *vctx, int layer_idx, int pos,
+                                const float *k_host, const float *v_host,
+                                int n_tokens, int kv_dim)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    if (!ctx || !ctx->gpu_key_cache || !ctx->gpu_value_cache) return -1;
+    if (layer_idx < 0 || layer_idx >= ctx->gpu_kv_n_layers) return -1;
+    if (kv_dim != ctx->gpu_kv_dim) return -1;
+    if (pos < 0 || n_tokens <= 0) return -1;
+    int seq_len = ctx->gpu_kv_seq_len;
+    size_t layer_off_floats = (size_t)layer_idx * (size_t)seq_len * (size_t)kv_dim;
+    float *k_base = (float *)[ctx->gpu_key_cache contents]   + layer_off_floats;
+    float *v_base = (float *)[ctx->gpu_value_cache contents] + layer_off_floats;
+    int tail = pos % seq_len;
+    int first = n_tokens;
+    if (tail + first > seq_len) first = seq_len - tail;
+    if (first > 0) {
+        memcpy(k_base + (size_t)tail * (size_t)kv_dim,
+               k_host, (size_t)first * (size_t)kv_dim * sizeof(float));
+        memcpy(v_base + (size_t)tail * (size_t)kv_dim,
+               v_host, (size_t)first * (size_t)kv_dim * sizeof(float));
+    }
+    int second = n_tokens - first;
+    if (second > 0) {
+        memcpy(k_base,
+               k_host + (size_t)first * (size_t)kv_dim,
+               (size_t)second * (size_t)kv_dim * sizeof(float));
+        memcpy(v_base,
+               v_host + (size_t)first * (size_t)kv_dim,
+               (size_t)second * (size_t)kv_dim * sizeof(float));
+    }
+    return 0;
+}
+
+
+static int metal_ensure_ssm_prefill_buf(BnMetalCtx *ctx, size_t bytes)
+{
+    if (ctx->ssm_prefill_buf && ctx->ssm_prefill_buf_size >= bytes)
+        return 0;
+    size_t aligned = (bytes + 15) & ~(size_t)15;
+    ctx->ssm_prefill_buf = [ctx->device newBufferWithLength:aligned
+                                                    options:MTLResourceStorageModeShared];
+    if (!ctx->ssm_prefill_buf) return -1;
+    ctx->ssm_prefill_buf_size = aligned;
+    return 0;
+}
+
+static int metal_ensure_batch_act_buf(BnMetalCtx *ctx, size_t bytes)
+{
+    size_t aligned = (bytes + 15) & ~(size_t)15;
+    for (int i = 0; i < 2; i++) {
+        if (ctx->batch_act_buf[i] && ctx->batch_act_buf_size[i] >= aligned)
+            continue;
+        ctx->batch_act_buf[i] =
+            [ctx->device newBufferWithLength:aligned
+                                     options:MTLResourceStorageModeShared];
+        if (!ctx->batch_act_buf[i]) return -1;
+        ctx->batch_act_buf_size[i] = aligned;
+    }
+    return 0;
+}
+
+static void metal_sync_buf(BnMetalCtx *ctx,
+                           id<MTLComputeCommandEncoder> __strong *encp,
+                           id<MTLCommandBuffer> cmd,
+                           id<MTLResource> res)
+{
+    (void)ctx; (void)cmd; (void)res;
+    id<MTLComputeCommandEncoder> enc = *encp;
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+static int metal_prefill_begin_batch(void *vctx, const float *X,
+                                     int n_tokens, int dim)
+{
+    (void)vctx; (void)X; (void)n_tokens; (void)dim;
+    return -1;
+}
+
+static int metal_prefill_flush(void *vctx, float *out, int n_tokens, int dim)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    if (!ctx || !ctx->batch_active) return -1;
+
+    [ctx->batch_enc endEncoding];
+    [ctx->batch_cmd commit];
+    [ctx->batch_cmd waitUntilCompleted];
+
+    if (out && n_tokens > 0 && dim > 0) {
+        size_t bytes = (size_t)n_tokens * (size_t)dim * sizeof(float);
+        id<MTLBuffer> chain = ctx->batch_act_buf[ctx->batch_chain_index];
+        if (chain && ctx->batch_act_buf_size[ctx->batch_chain_index] >= bytes)
+            memcpy(out, [chain contents], bytes);
+    }
+
+    ctx->batch_cmd = nil;
+    ctx->batch_enc = nil;
+    ctx->batch_active = 0;
+    return 0;
+}
+
+static int metal_prefill_ssm_layer(
+        void *vctx, float *out, void *wqkv_buf, void *wz_buf,
+        void *alpha_buf, void *beta_buf, void *qkvz_stacked_buf,
+        void *ab_stacked_buf, void *ssm_out_buf, void *attn_norm_buf,
+        void *conv1d_buf, void *dt_bias_buf, void *a_log_buf,
+        void *ssm_norm_buf, void *ffn_gate_buf, void *ffn_up_buf,
+        void *ffn_down_buf, void *ffn_norm_buf,
+        const float *X, int n_tokens, int dim, int qkv_dim, int inner_dim,
+        int num_k_heads, int head_k_dim, int num_v_heads, int head_v_dim,
+        int conv_kernel, int ssm_idx, int wqkv_type, int wz_type,
+        int alpha_type, int beta_type, int out_type, int hidden_dim,
+        int ffn_gate_type, int ffn_up_type, int ffn_down_type, int act_type,
+        float norm_eps, int *did_ffn)
+{
+    (void)qkvz_stacked_buf; (void)ab_stacked_buf;
+
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    if (did_ffn) *did_ffn = 0;
+    if (!ctx) return -1;
+    if (!ctx->ssm_prefill_enabled) return -1;
+
+    if (n_tokens <= 1 || dim <= 0 || qkv_dim <= 0 || inner_dim <= 0 ||
+        num_k_heads <= 0 || num_v_heads <= 0 ||
+        head_k_dim != 128 || head_v_dim != 128 ||
+        inner_dim != num_v_heads * head_v_dim ||
+        qkv_dim != 2 * num_k_heads * head_k_dim + inner_dim ||
+        conv_kernel < 2 || conv_kernel > 8 || ssm_idx < 0)
+        return -1;
+
+    BnMetalBuf *wqkv      = (BnMetalBuf *)wqkv_buf;
+    BnMetalBuf *wz        = (BnMetalBuf *)wz_buf;
+    BnMetalBuf *alpha_w   = (BnMetalBuf *)alpha_buf;
+    BnMetalBuf *beta_w    = (BnMetalBuf *)beta_buf;
+    BnMetalBuf *ssm_out   = (BnMetalBuf *)ssm_out_buf;
+    BnMetalBuf *attn_norm = (BnMetalBuf *)attn_norm_buf;
+    BnMetalBuf *conv1d    = (BnMetalBuf *)conv1d_buf;
+    BnMetalBuf *dt_bias   = (BnMetalBuf *)dt_bias_buf;
+    BnMetalBuf *a_log     = (BnMetalBuf *)a_log_buf;
+    BnMetalBuf *ssm_norm  = (BnMetalBuf *)ssm_norm_buf;
+    if (!wqkv || !wz || !alpha_w || !beta_w || !ssm_out ||
+        !attn_norm || !conv1d || !dt_bias || !a_log || !ssm_norm)
+        return -1;
+    if (wqkv->q4_prepared || wz->q4_prepared || alpha_w->q4_prepared ||
+        beta_w->q4_prepared || ssm_out->q4_prepared)
+        return -1;
+    if (wqkv_type < 0 || wqkv_type >= BN_METAL_MAX_TYPES ||
+        wz_type   < 0 || wz_type   >= BN_METAL_MAX_TYPES ||
+        alpha_type < 0 || alpha_type >= BN_METAL_MAX_TYPES ||
+        beta_type  < 0 || beta_type  >= BN_METAL_MAX_TYPES ||
+        out_type   < 0 || out_type   >= BN_METAL_MAX_TYPES ||
+        !ctx->pipelines[wqkv_type] || !ctx->pipelines[wz_type] ||
+        !ctx->pipelines[alpha_type] || !ctx->pipelines[beta_type] ||
+        !ctx->pipelines[out_type])
+        return -1;
+    if (!ctx->act_bufs[BN_GPU_BUF_SSM_STATE] ||
+        !ctx->act_bufs[BN_GPU_BUF_SSM_CONV_STATE])
+        return -1;
+
+    BnMetalBuf *ffn_gate_w = (BnMetalBuf *)ffn_gate_buf;
+    BnMetalBuf *ffn_up_w   = (BnMetalBuf *)ffn_up_buf;
+    BnMetalBuf *ffn_down_w = (BnMetalBuf *)ffn_down_buf;
+    BnMetalBuf *ffn_norm_w = (BnMetalBuf *)ffn_norm_buf;
+    int ffn_stacked = (ffn_gate_w && !ffn_up_w);
+    int fuse_ffn = (hidden_dim > 0 && act_type == 0 &&
+                    ffn_gate_w && ffn_gate_w->buf &&
+                    (ffn_stacked || (ffn_up_w && ffn_up_w->buf &&
+                                     !ffn_up_w->q4_prepared)) &&
+                    ffn_down_w && ffn_down_w->buf &&
+                    ffn_norm_w && ffn_norm_w->buf &&
+                    !ffn_gate_w->q4_prepared &&
+                    !ffn_down_w->q4_prepared &&
+                    ffn_gate_type >= 0 && ffn_gate_type < BN_METAL_MAX_TYPES &&
+                    ffn_down_type >= 0 && ffn_down_type < BN_METAL_MAX_TYPES &&
+                    ctx->pipelines[ffn_gate_type] &&
+                    ctx->pipelines[ffn_down_type] &&
+                    ctx->fwd_pipelines[BN_GPU_SHADER_SILU_GATE] &&
+                    ctx->fwd_pipelines[BN_GPU_SHADER_COPY] &&
+                    (!ffn_stacked || ctx->ssm_prefill_silu_gate_stacked_pipeline) &&
+                    (ffn_stacked || (ffn_up_type >= 0 &&
+                                     ffn_up_type < BN_METAL_MAX_TYPES &&
+                                     ctx->pipelines[ffn_up_type])));
+
+    size_t dim_values   = (size_t)n_tokens * (size_t)dim;
+    size_t qkv_values   = (size_t)n_tokens * (size_t)qkv_dim;
+    size_t z_values     = (size_t)n_tokens * (size_t)inner_dim;
+    size_t ab_values    = (size_t)n_tokens * (size_t)num_v_heads;
+    size_t hidden_values = fuse_ffn
+        ? (size_t)n_tokens * (size_t)hidden_dim : 0;
+    size_t off_norm  = 0;
+    size_t off_qkv   = off_norm  + dim_values;
+    size_t off_z     = off_qkv   + qkv_values;
+    size_t off_ssm   = off_z     + z_values;
+    size_t off_alpha = off_ssm   + z_values;
+    size_t off_beta  = off_alpha + ab_values;
+    size_t off_ffn_residual = off_beta + ab_values;
+    size_t off_ffn_norm     = off_ffn_residual + (fuse_ffn ? dim_values : 0);
+    size_t off_ffn_act      = off_ffn_norm     + (fuse_ffn ? dim_values : 0);
+    size_t off_ffn_post     = off_ffn_act + hidden_values * 2;
+    size_t scratch_floats   = off_ffn_post + hidden_values;
+
+    if (metal_ensure_ssm_prefill_buf(ctx, scratch_floats * sizeof(float)) != 0)
+        return -1;
+
+    id<MTLBuffer> x_id  = nil;
+    id<MTLBuffer> out_id = nil;
+    if (ctx->batch_active) {
+        if (metal_ensure_batch_act_buf(ctx, dim_values * sizeof(float)) != 0)
+            return -1;
+        x_id  = ctx->batch_act_buf[ctx->batch_chain_index];
+        out_id = ctx->batch_act_buf[ctx->batch_chain_index ^ 1];
+    } else {
+        if (ensure_scratch(ctx, dim_values * sizeof(float),
+                           dim_values * sizeof(float)) != 0)
+            return -1;
+        x_id  = ctx->x_buf;
+        out_id = ctx->out_buf;
+        memcpy([x_id contents], X, dim_values * sizeof(float));
+    }
+
+    const uint32_t key_dim = (uint32_t)(num_k_heads * head_k_dim);
+    const float q_scale = 1.0f / sqrtf((float)head_k_dim);
+    const uint32_t state_off_bytes =
+        (uint32_t)((size_t)ssm_idx * (size_t)num_v_heads *
+                   (size_t)head_k_dim * (size_t)head_v_dim * sizeof(float));
+    const uint32_t conv_off_floats =
+        (uint32_t)((size_t)ssm_idx * (size_t)(conv_kernel - 1) *
+                   (size_t)qkv_dim);
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd =
+            ctx->batch_active ? ctx->batch_cmd : [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc =
+            ctx->batch_active ? ctx->batch_enc : [cmd computeCommandEncoder];
+
+#define SSM_CHECKPOINT(NAME, SLOT) do { (void)(NAME); (void)(SLOT); } while (0)
+
+        {
+            uint32_t params[8] = { (uint32_t)dim, 0, 0, 0, 0, 0, 0, 0 };
+            memcpy(&params[1], &norm_eps, sizeof(float));
+            [enc setComputePipelineState:ctx->ssm_prefill_rmsnorm_pipeline];
+            [enc setBuffer:x_id offset:0 atIndex:0];
+            [enc setBuffer:attn_norm->buf offset:attn_norm->offset atIndex:1];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_norm * sizeof(float) atIndex:2];
+            [enc setBytes:params length:sizeof(params) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        SSM_CHECKPOINT("rmsnorm_in", 0);
+
+        struct {
+            BnMetalBuf *w;
+            int type;
+            uint32_t rows;
+            size_t   out_off;
+        } projs[4] = {
+            { wqkv,    wqkv_type,  (uint32_t)qkv_dim,     off_qkv   },
+            { wz,      wz_type,    (uint32_t)inner_dim,   off_z     },
+            { alpha_w, alpha_type, (uint32_t)num_v_heads, off_alpha },
+            { beta_w,  beta_type,  (uint32_t)num_v_heads, off_beta  },
+        };
+        for (int proj_i = 0; proj_i < 4; proj_i++) {
+            metal_encode_matmul(ctx, enc, projs[proj_i].w,
+                                 ctx->ssm_prefill_buf, off_norm * sizeof(float),
+                                 ctx->ssm_prefill_buf,
+                                 projs[proj_i].out_off * sizeof(float),
+                                 projs[proj_i].type,
+                                 (int)projs[proj_i].rows, dim, n_tokens);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            SSM_CHECKPOINT(proj_i == 0 ? "wqkv_matmul"
+                         : proj_i == 1 ? "wz_matmul"
+                         : proj_i == 2 ? "alpha_matmul"
+                         :               "beta_matmul",
+                           1 + proj_i);
+        }
+
+        {
+            uint32_t params[8] = { (uint32_t)qkv_dim, (uint32_t)conv_kernel,
+                                   conv_off_floats, (uint32_t)n_tokens,
+                                   0, 0, 0, 0 };
+            uint32_t wg_x = ((uint32_t)qkv_dim + 255u) / 256u;
+            [enc setComputePipelineState:ctx->ssm_prefill_conv_silu_pipeline];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_qkv * sizeof(float) atIndex:0];
+            [enc setBuffer:ctx->act_bufs[BN_GPU_BUF_SSM_CONV_STATE]
+                    offset:0 atIndex:1];
+            [enc setBuffer:conv1d->buf offset:conv1d->offset atIndex:2];
+            [enc setBytes:params length:sizeof(params) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(wg_x, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        SSM_CHECKPOINT("conv_silu", 5);
+
+        int use_precise = 0;
+        int fuse_alpha_beta =
+            !use_precise &&
+            ctx->ssm_prefill_delta_fused_ab_pipeline != nil;
+        int fuse_l2norm = 0;
+
+        if (!fuse_l2norm) {
+            uint32_t params[8] = { (uint32_t)head_k_dim, 0, key_dim,
+                                   (uint32_t)num_k_heads, (uint32_t)qkv_dim,
+                                   0, 0, 0 };
+            [enc setComputePipelineState:ctx->ssm_prefill_l2norm_pipeline];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_qkv * sizeof(float) atIndex:0];
+            [enc setBytes:params length:sizeof(params) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_k_heads,
+                                                  (NSUInteger)n_tokens, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        SSM_CHECKPOINT("l2norm", 6);
+
+        if (!fuse_alpha_beta) {
+            uint32_t params[8] = { (uint32_t)num_v_heads, (uint32_t)n_tokens,
+                                   0, 0, 0, 0, 0, 0 };
+            uint32_t total = (uint32_t)num_v_heads * (uint32_t)n_tokens;
+            uint32_t wg_x = (total + 255u) / 256u;
+            [enc setComputePipelineState:ctx->ssm_prefill_alpha_beta_pipeline];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_alpha * sizeof(float) atIndex:0];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_beta * sizeof(float) atIndex:1];
+            [enc setBuffer:dt_bias->buf offset:dt_bias->offset atIndex:2];
+            [enc setBuffer:a_log->buf offset:a_log->offset atIndex:3];
+            [enc setBytes:params length:sizeof(params) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(wg_x, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        SSM_CHECKPOINT("alpha_beta", 7);
+
+        {
+            uint32_t qs_bits;
+            memcpy(&qs_bits, &q_scale, sizeof(float));
+            uint32_t params[8] = { (uint32_t)n_tokens, (uint32_t)qkv_dim,
+                                   (uint32_t)num_k_heads,
+                                   (uint32_t)num_v_heads, qs_bits,
+                                   state_off_bytes, 0, key_dim };
+            id<MTLComputePipelineState> delta_pso = use_precise
+                ? ctx->ssm_prefill_delta_precise_pipeline
+                : (fuse_l2norm
+                       ? ctx->ssm_prefill_delta_fused_full_pipeline
+                       : (fuse_alpha_beta
+                              ? ctx->ssm_prefill_delta_fused_ab_pipeline
+                              : ctx->ssm_prefill_delta_pipeline));
+            [enc setComputePipelineState:delta_pso];
+            [enc setBuffer:ctx->act_bufs[BN_GPU_BUF_SSM_STATE] offset:0 atIndex:0];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_ssm * sizeof(float) atIndex:1];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_qkv * sizeof(float) atIndex:2];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_alpha * sizeof(float) atIndex:3];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_beta * sizeof(float) atIndex:4];
+            [enc setBytes:params length:sizeof(params) atIndex:5];
+            [enc setBuffer:dt_bias->buf offset:dt_bias->offset atIndex:6];
+            [enc setBuffer:a_log->buf offset:a_log->offset atIndex:7];
+            if (use_precise) {
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_v_heads,
+                                                       1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_v_heads,
+                                                       32, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            }
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        SSM_CHECKPOINT("delta", 8);
+
+        {
+            uint32_t eps_bits;
+            memcpy(&eps_bits, &norm_eps, sizeof(float));
+            uint32_t params[8] = { (uint32_t)head_v_dim, eps_bits,
+                                   (uint32_t)num_v_heads, 0, 0, 0, 0, 0 };
+            [enc setComputePipelineState:ctx->ssm_prefill_gate_pipeline];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_ssm * sizeof(float) atIndex:0];
+            [enc setBuffer:ctx->ssm_prefill_buf
+                    offset:off_z * sizeof(float) atIndex:1];
+            [enc setBuffer:ssm_norm->buf offset:ssm_norm->offset atIndex:2];
+            [enc setBytes:params length:sizeof(params) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_v_heads,
+                                                   (NSUInteger)n_tokens, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        SSM_CHECKPOINT("gate", 9);
+
+        {
+            metal_encode_matmul(ctx, enc, ssm_out,
+                                 ctx->ssm_prefill_buf, off_ssm * sizeof(float),
+                                 out_id, 0,
+                                 out_type, dim, inner_dim, n_tokens);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        SSM_CHECKPOINT("ssm_out_matmul", 10);
+
+        {
+            uint32_t total = (uint32_t)dim_values;
+            uint32_t params[8] = { total, 0, 0, 0, 0, 0, 0, 0 };
+            uint32_t wg_x = (total + 255u) / 256u;
+            [enc setComputePipelineState:ctx->fwd_pipelines[BN_GPU_SHADER_RESIDUAL_ADD]];
+            [enc setBuffer:out_id offset:0 atIndex:0];
+            [enc setBuffer:x_id offset:0 atIndex:1];
+            [enc setBytes:params length:sizeof(params) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(wg_x, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        SSM_CHECKPOINT("residual_add", 11);
+
+        if (fuse_ffn) {
+            {
+                uint32_t params[8] = { (uint32_t)dim, 0, 0, 0, 0, 0, 0, 0 };
+                memcpy(&params[1], &norm_eps, sizeof(float));
+                [enc setComputePipelineState:ctx->ssm_prefill_rmsnorm_pipeline];
+                [enc setBuffer:out_id offset:0 atIndex:0];
+                [enc setBuffer:ffn_norm_w->buf offset:ffn_norm_w->offset atIndex:1];
+                [enc setBuffer:ctx->ssm_prefill_buf
+                        offset:off_ffn_norm * sizeof(float) atIndex:2];
+                [enc setBytes:params length:sizeof(params) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            SSM_CHECKPOINT("ffn_rmsnorm", 12);
+
+            metal_sync_buf(ctx, &enc, cmd, ctx->ssm_prefill_buf);
+            if (ffn_stacked) {
+                metal_encode_matmul(ctx, enc, ffn_gate_w,
+                                     ctx->ssm_prefill_buf,
+                                     off_ffn_norm * sizeof(float),
+                                     ctx->ssm_prefill_buf,
+                                     off_ffn_act * sizeof(float),
+                                     ffn_gate_type, hidden_dim * 2,
+                                     dim, n_tokens);
+                metal_sync_buf(ctx, &enc, cmd, ctx->ssm_prefill_buf);
+                SSM_CHECKPOINT("ffn_gateup_stacked", 13);
+            } else {
+                struct {
+                    BnMetalBuf *w;
+                    int type;
+                    size_t out_off;
+                } ffn_projs[2] = {
+                    { ffn_gate_w, ffn_gate_type, off_ffn_act },
+                    { ffn_up_w,   ffn_up_type,   off_ffn_act + hidden_values },
+                };
+                for (int proj_i = 0; proj_i < 2; proj_i++) {
+                    metal_encode_matmul(ctx, enc, ffn_projs[proj_i].w,
+                                         ctx->ssm_prefill_buf,
+                                         off_ffn_norm * sizeof(float),
+                                         ctx->ssm_prefill_buf,
+                                         ffn_projs[proj_i].out_off * sizeof(float),
+                                         ffn_projs[proj_i].type, hidden_dim,
+                                         dim, n_tokens);
+                    metal_sync_buf(ctx, &enc, cmd, ctx->ssm_prefill_buf);
+                }
+            }
+
+            if (ffn_stacked) {
+                uint32_t params[8] = { (uint32_t)hidden_dim,
+                                       (uint32_t)n_tokens, 0, 0, 0, 0, 0, 0 };
+                uint32_t wg_x = ((uint32_t)hidden_dim + 255u) / 256u;
+                [enc setComputePipelineState:ctx->ssm_prefill_silu_gate_stacked_pipeline];
+                [enc setBuffer:ctx->ssm_prefill_buf
+                        offset:off_ffn_act * sizeof(float) atIndex:0];
+                [enc setBuffer:ctx->ssm_prefill_buf
+                        offset:off_ffn_post * sizeof(float) atIndex:1];
+                [enc setBytes:params length:sizeof(params) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(wg_x, (NSUInteger)n_tokens, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                uint32_t total = (uint32_t)hidden_values;
+                uint32_t params[8] = { total, 0, 0, 0, 0, 0, 0, 0 };
+                uint32_t wg_x = (total + 255u) / 256u;
+                [enc setComputePipelineState:ctx->fwd_pipelines[BN_GPU_SHADER_SILU_GATE]];
+                [enc setBuffer:ctx->ssm_prefill_buf
+                        offset:off_ffn_act * sizeof(float) atIndex:0];
+                [enc setBuffer:ctx->ssm_prefill_buf
+                        offset:(off_ffn_act + hidden_values) * sizeof(float) atIndex:1];
+                [enc setBytes:params length:sizeof(params) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(wg_x, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+
+            {
+                size_t ffn_down_in_off =
+                    ffn_stacked ? off_ffn_post : off_ffn_act;
+                metal_encode_matmul(ctx, enc, ffn_down_w,
+                                     ctx->ssm_prefill_buf,
+                                     ffn_down_in_off * sizeof(float),
+                                     ctx->ssm_prefill_buf,
+                                     off_ffn_residual * sizeof(float),
+                                     ffn_down_type, dim, hidden_dim, n_tokens);
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            SSM_CHECKPOINT("ffn_down_matmul", 14);
+
+            {
+                uint32_t total = (uint32_t)dim_values;
+                uint32_t params[8] = { total, 0, 0, 0, 0, 0, 0, 0 };
+                uint32_t wg_x = (total + 255u) / 256u;
+                [enc setComputePipelineState:ctx->fwd_pipelines[BN_GPU_SHADER_RESIDUAL_ADD]];
+                [enc setBuffer:out_id offset:0 atIndex:0];
+                [enc setBuffer:ctx->ssm_prefill_buf
+                        offset:off_ffn_residual * sizeof(float) atIndex:1];
+                [enc setBytes:params length:sizeof(params) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(wg_x, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
+        }
+
+        if (ctx->batch_active) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            ctx->batch_chain_index ^= 1;
+        } else {
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+        }
+    }
+#undef SSM_CHECKPOINT
+
+    if (out && !ctx->batch_active)
+        memcpy(out, [ctx->out_buf contents], dim_values * sizeof(float));
+
+    if (did_ffn) *did_ffn = fuse_ffn ? 1 : 0;
+
+    return 0;
+}
+
+
+static int metal_ensure_attn_scratch(BnMetalCtx *ctx,
+                                     size_t q_bytes,
+                                     size_t kv_bytes,
+                                     size_t out_bytes)
+{
+    size_t need = q_bytes;
+    if (kv_bytes > need)  need = kv_bytes;
+    if (out_bytes > need) need = out_bytes;
+    size_t aligned = (need + 15) & ~(size_t)15;
+    if (!ctx->ssm_prefill_buf || ctx->ssm_prefill_buf_size < aligned)
+        return metal_ensure_ssm_prefill_buf(ctx, aligned);
+    return 0;
+}
+
+static int metal_prefill_attention(void *vctx, float *out,
+                                   const float *Q, const float *K,
+                                   const float *V,
+                                   int n_tokens, int n_heads,
+                                   int n_kv_heads, int head_size,
+                                   int kv_mul, int kv_dim,
+                                   float attention_scale,
+                                   int pos0, int seq_len,
+                                   const float *key_cache,
+                                   const float *value_cache, size_t loff)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    if (!ctx || !out || !Q || !K || !V) return -1;
+    if (n_tokens <= 1 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_size <= 0 || kv_mul <= 0 || kv_dim <= 0)
+        return -1;
+    size_t max_pos_n = (size_t)pos0 + (size_t)n_tokens;
+    id<MTLComputePipelineState> attn_pso = NULL;
+    if (max_pos_n <= 4096)
+        attn_pso = ctx->prefill_attn_pipeline;
+    else if (max_pos_n <= 6144)
+        attn_pso = ctx->prefill_attn_pipeline_6144
+                     ?: ctx->prefill_attn_pipeline;
+    else
+        return -1;
+    if (!attn_pso) return -1;
+
+    int use_cache = pos0 > 0 ? 1 : 0;
+    if (use_cache && (!key_cache || !value_cache || seq_len <= 0))
+        return -1;
+    if (use_cache && (size_t)pos0 + (size_t)loff > SIZE_MAX / sizeof(float))
+        return -1;
+
+    int gpu_cache_path = 0;
+    size_t gpu_layer_loff = 0;
+    if (use_cache && ctx->gpu_key_cache && ctx->gpu_value_cache &&
+        ctx->gpu_kv_dim == kv_dim &&
+        (size_t)pos0 <= (size_t)ctx->gpu_kv_seq_len) {
+        size_t layer_stride =
+            (size_t)ctx->gpu_kv_seq_len * (size_t)kv_dim;
+        if (layer_stride > 0 && (loff % layer_stride) == 0) {
+            size_t layer_idx = loff / layer_stride;
+            if (layer_idx < (size_t)ctx->gpu_kv_n_layers) {
+                gpu_cache_path = 1;
+                gpu_layer_loff = layer_idx * layer_stride;
+            }
+        }
+    }
+
+    size_t q_floats   = (size_t)n_tokens * (size_t)n_heads    * (size_t)head_size;
+    size_t kv_floats  = (size_t)n_tokens * (size_t)n_kv_heads * (size_t)head_size;
+    size_t out_floats = q_floats;
+    size_t past_floats = (use_cache && !gpu_cache_path)
+                           ? (size_t)pos0 * (size_t)kv_dim : 0;
+    size_t total = q_floats + kv_floats + kv_floats + out_floats +
+                   past_floats * 2;
+    if (metal_ensure_ssm_prefill_buf(ctx, total * sizeof(float)) != 0)
+        return -1;
+    (void)metal_ensure_attn_scratch;
+    size_t off_q       = 0;
+    size_t off_k       = off_q + q_floats;
+    size_t off_v       = off_k + kv_floats;
+    size_t off_o       = off_v + kv_floats;
+    size_t off_past_k  = off_o + out_floats;
+    size_t off_past_v  = off_past_k + past_floats;
+
+    float *scratch_base = (float *)[ctx->ssm_prefill_buf contents];
+    memcpy(scratch_base + off_q, Q, q_floats * sizeof(float));
+    memcpy(scratch_base + off_k, K, kv_floats * sizeof(float));
+    memcpy(scratch_base + off_v, V, kv_floats * sizeof(float));
+    if (use_cache && !gpu_cache_path) {
+        if ((size_t)pos0 > (size_t)seq_len)
+            return -1;
+        memcpy(scratch_base + off_past_k,
+               key_cache   + loff, past_floats * sizeof(float));
+        memcpy(scratch_base + off_past_v,
+               value_cache + loff, past_floats * sizeof(float));
+    }
+
+    uint32_t scale_bits;
+    memcpy(&scale_bits, &attention_scale, sizeof(float));
+    uint32_t shader_seq_len = gpu_cache_path ? (uint32_t)ctx->gpu_kv_seq_len
+                            : (use_cache ? (uint32_t)pos0 : 0u);
+    uint32_t params[12] = {
+        (uint32_t)n_tokens, (uint32_t)n_heads, (uint32_t)n_kv_heads,
+        (uint32_t)head_size, (uint32_t)kv_mul,
+        (uint32_t)(use_cache ? pos0 : 0),
+        shader_seq_len, scale_bits,
+        0u,
+        (uint32_t)kv_dim, (uint32_t)use_cache,
+        0u };
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:attn_pso];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_q       * sizeof(float) atIndex:0];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_k       * sizeof(float) atIndex:1];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_v       * sizeof(float) atIndex:2];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_o       * sizeof(float) atIndex:3];
+        if (gpu_cache_path) {
+            [enc setBuffer:ctx->gpu_key_cache
+                    offset:gpu_layer_loff * sizeof(float) atIndex:4];
+            [enc setBuffer:ctx->gpu_value_cache
+                    offset:gpu_layer_loff * sizeof(float) atIndex:5];
+        } else {
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_past_k * sizeof(float) atIndex:4];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_past_v * sizeof(float) atIndex:5];
+        }
+        [enc setBytes:params length:sizeof(params) atIndex:6];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_q * sizeof(float) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads,
+                                              (NSUInteger)n_tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+
+    memcpy(out, scratch_base + off_o, out_floats * sizeof(float));
+    return 0;
+}
+
+
+static int metal_prefill_kv_prep(void *vctx, float *K, float *V,
+                                 const float *k_bias, const float *v_bias,
+                                 const float *k_norm_w,
+                                 const float *rope_cos, const float *rope_sin,
+                                 int n_tokens, int n_kv_heads, int head_size,
+                                 int rope_dims, int qk_norm_per_head,
+                                 float norm_eps)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    if (!ctx || !K || !V) return -1;
+    if (n_tokens <= 0 || n_kv_heads <= 0 || head_size <= 0) return -1;
+    if (head_size > 256) return -1;
+    if (!ctx->prefill_kv_prep_pipeline) return -1;
+
+    int use_k_bias = k_bias != NULL ? 1 : 0;
+    int use_v_bias = v_bias != NULL ? 1 : 0;
+    int use_k_norm = k_norm_w != NULL ? 1 : 0;
+    int use_rope   = (rope_cos != NULL && rope_sin != NULL && rope_dims > 0) ? 1 : 0;
+
+    size_t kv_dim = (size_t)n_kv_heads * (size_t)head_size;
+    size_t kv_floats = (size_t)n_tokens * kv_dim;
+    size_t norm_floats = (size_t)(qk_norm_per_head ? n_kv_heads : 1) * head_size;
+    size_t bias_floats = kv_dim;
+    size_t rope_floats = (size_t)n_tokens * (size_t)(rope_dims / 2);
+    size_t off_k     = 0;
+    size_t off_v     = off_k    + kv_floats;
+    size_t off_kb    = off_v    + kv_floats;
+    size_t off_vb    = off_kb   + (use_k_bias ? bias_floats : 0);
+    size_t off_kn    = off_vb   + (use_v_bias ? bias_floats : 0);
+    size_t off_rc    = off_kn   + (use_k_norm ? norm_floats : 0);
+    size_t off_rs    = off_rc   + (use_rope ? rope_floats : 0);
+    size_t total     = off_rs   + (use_rope ? rope_floats : 0);
+    if (metal_ensure_ssm_prefill_buf(ctx, total * sizeof(float)) != 0)
+        return -1;
+
+    float *scratch = (float *)[ctx->ssm_prefill_buf contents];
+    memcpy(scratch + off_k, K, kv_floats * sizeof(float));
+    memcpy(scratch + off_v, V, kv_floats * sizeof(float));
+    if (use_k_bias) memcpy(scratch + off_kb, k_bias, bias_floats * sizeof(float));
+    if (use_v_bias) memcpy(scratch + off_vb, v_bias, bias_floats * sizeof(float));
+    if (use_k_norm) memcpy(scratch + off_kn, k_norm_w, norm_floats * sizeof(float));
+    if (use_rope) {
+        memcpy(scratch + off_rc, rope_cos, rope_floats * sizeof(float));
+        memcpy(scratch + off_rs, rope_sin, rope_floats * sizeof(float));
+    }
+
+    uint32_t eps_bits;
+    memcpy(&eps_bits, &norm_eps, sizeof(float));
+    uint32_t params[12] = {
+        (uint32_t)n_kv_heads, (uint32_t)head_size, (uint32_t)n_tokens,
+        (uint32_t)rope_dims, (uint32_t)qk_norm_per_head,
+        (uint32_t)use_k_bias, (uint32_t)use_v_bias,
+        (uint32_t)use_k_norm, (uint32_t)use_rope,
+        eps_bits, (uint32_t)(rope_dims / 2), 0u };
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:ctx->prefill_kv_prep_pipeline];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_k  * sizeof(float) atIndex:0];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_v  * sizeof(float) atIndex:1];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_kb * sizeof(float) atIndex:2];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_vb * sizeof(float) atIndex:3];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_kn * sizeof(float) atIndex:4];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_rc * sizeof(float) atIndex:5];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_rs * sizeof(float) atIndex:6];
+        [enc setBytes:params length:sizeof(params) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_kv_heads,
+                                              (NSUInteger)n_tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+
+    memcpy(K, scratch + off_k, kv_floats * sizeof(float));
+    memcpy(V, scratch + off_v, kv_floats * sizeof(float));
+    return 0;
+}
+
+
+static int metal_prefill_attention_wo(void *vctx, float *out, void *wo_buf,
+                                      const float *Q, const float *K,
+                                      const float *V, int n_tokens,
+                                      int n_heads, int n_kv_heads,
+                                      int head_size, int kv_mul, int kv_dim,
+                                      int wo_rows, int wo_cols, int wo_type,
+                                      float attention_scale,
+                                      int pos0, int seq_len,
+                                      const float *key_cache,
+                                      const float *value_cache, size_t loff,
+                                      const float *gate)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    BnMetalBuf *wo  = (BnMetalBuf *)wo_buf;
+    if (!ctx || !out || !wo || !Q || !K || !V) return -1;
+    if (n_tokens <= 1 || n_heads <= 0 || n_kv_heads <= 0 ||
+        head_size <= 0 || kv_mul <= 0 || kv_dim <= 0 ||
+        wo_rows <= 0 || wo_cols <= 0)
+        return -1;
+    if (wo_type < 0 || wo_type >= BN_METAL_MAX_TYPES) return -1;
+    if (wo->q4_prepared) return -1;
+    if (!ctx->pipelines[wo_type] && !ctx->q4k_mul_mm_pipeline &&
+        !ctx->q5k_mul_mm_pipeline)
+        return -1;
+    size_t max_pos_n_wo = (size_t)pos0 + (size_t)n_tokens;
+    id<MTLComputePipelineState> attn_pso_wo = NULL;
+    if (max_pos_n_wo <= 4096)
+        attn_pso_wo = ctx->prefill_attn_pipeline;
+    else if (max_pos_n_wo <= 6144)
+        attn_pso_wo = ctx->prefill_attn_pipeline_6144
+                        ?: ctx->prefill_attn_pipeline;
+    else
+        return -1;
+    if (!attn_pso_wo) return -1;
+    if (wo_cols != n_heads * head_size) return -1;
+
+    int use_cache = pos0 > 0 ? 1 : 0;
+    int use_q_gate = gate != NULL ? 1 : 0;
+    if (use_cache && (!key_cache || !value_cache || seq_len <= 0))
+        return -1;
+
+    int gpu_cache_path = 0;
+    size_t gpu_layer_loff = 0;
+    if (use_cache && ctx->gpu_key_cache && ctx->gpu_value_cache &&
+        ctx->gpu_kv_dim == kv_dim &&
+        (size_t)pos0 <= (size_t)ctx->gpu_kv_seq_len) {
+        size_t layer_stride =
+            (size_t)ctx->gpu_kv_seq_len * (size_t)kv_dim;
+        if (layer_stride > 0 && (loff % layer_stride) == 0) {
+            size_t layer_idx = loff / layer_stride;
+            if (layer_idx < (size_t)ctx->gpu_kv_n_layers) {
+                gpu_cache_path = 1;
+                gpu_layer_loff = layer_idx * layer_stride;
+            }
+        }
+    }
+
+    size_t q_floats    = (size_t)n_tokens * (size_t)n_heads * (size_t)head_size;
+    size_t kv_floats   = (size_t)n_tokens * (size_t)kv_dim;
+    size_t out_floats  = q_floats;
+    size_t wo_floats   = (size_t)n_tokens * (size_t)wo_rows;
+    size_t past_floats = (use_cache && !gpu_cache_path)
+                           ? (size_t)pos0 * (size_t)kv_dim : 0;
+    size_t gate_floats = use_q_gate ? q_floats : 0;
+    size_t total = q_floats + kv_floats + kv_floats + out_floats + wo_floats +
+                   past_floats * 2 + gate_floats;
+    if (metal_ensure_ssm_prefill_buf(ctx, total * sizeof(float)) != 0)
+        return -1;
+    size_t off_q        = 0;
+    size_t off_k        = off_q        + q_floats;
+    size_t off_v        = off_k        + kv_floats;
+    size_t off_attn_out = off_v        + kv_floats;
+    size_t off_wo_out   = off_attn_out + out_floats;
+    size_t off_past_k   = off_wo_out   + wo_floats;
+    size_t off_past_v   = off_past_k   + past_floats;
+    size_t off_gate     = off_past_v   + past_floats;
+
+    float *scratch_base = (float *)[ctx->ssm_prefill_buf contents];
+    memcpy(scratch_base + off_q, Q, q_floats * sizeof(float));
+    memcpy(scratch_base + off_k, K, kv_floats * sizeof(float));
+    memcpy(scratch_base + off_v, V, kv_floats * sizeof(float));
+    if (use_cache && !gpu_cache_path) {
+        if ((size_t)pos0 > (size_t)seq_len) return -1;
+        memcpy(scratch_base + off_past_k, key_cache + loff,
+               past_floats * sizeof(float));
+        memcpy(scratch_base + off_past_v, value_cache + loff,
+               past_floats * sizeof(float));
+    }
+    if (use_q_gate)
+        memcpy(scratch_base + off_gate, gate, gate_floats * sizeof(float));
+
+    uint32_t scale_bits;
+    memcpy(&scale_bits, &attention_scale, sizeof(float));
+    uint32_t shader_seq_len = gpu_cache_path ? (uint32_t)ctx->gpu_kv_seq_len
+                            : (use_cache ? (uint32_t)pos0 : 0u);
+    uint32_t params[12] = {
+        (uint32_t)n_tokens, (uint32_t)n_heads, (uint32_t)n_kv_heads,
+        (uint32_t)head_size, (uint32_t)kv_mul,
+        (uint32_t)(use_cache ? pos0 : 0),
+        shader_seq_len, scale_bits,
+        0u, (uint32_t)kv_dim, (uint32_t)use_cache, (uint32_t)use_q_gate };
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        [enc setComputePipelineState:attn_pso_wo];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_q        * sizeof(float) atIndex:0];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_k        * sizeof(float) atIndex:1];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_v        * sizeof(float) atIndex:2];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_attn_out * sizeof(float) atIndex:3];
+        if (gpu_cache_path) {
+            [enc setBuffer:ctx->gpu_key_cache
+                    offset:gpu_layer_loff * sizeof(float) atIndex:4];
+            [enc setBuffer:ctx->gpu_value_cache
+                    offset:gpu_layer_loff * sizeof(float) atIndex:5];
+        } else {
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_past_k * sizeof(float) atIndex:4];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_past_v * sizeof(float) atIndex:5];
+        }
+        [enc setBytes:params length:sizeof(params) atIndex:6];
+        [enc setBuffer:ctx->ssm_prefill_buf offset:off_gate     * sizeof(float) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_heads,
+                                              (NSUInteger)n_tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        metal_encode_matmul(ctx, enc, wo,
+                             ctx->ssm_prefill_buf,
+                             off_attn_out * sizeof(float),
+                             ctx->ssm_prefill_buf,
+                             off_wo_out * sizeof(float),
+                             wo_type, wo_rows, wo_cols, n_tokens);
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+
+    memcpy(out, scratch_base + off_wo_out, wo_floats * sizeof(float));
+    return 0;
+}
+
+static int metal_dense_ffn_batch_stub(void *vctx, float *out,
+                                      void *gate_buf, void *up_buf, void *down_buf,
+                                      const float *X, int n_tokens,
+                                      int dim, int hidden_dim,
+                                      int gate_type, int up_type,
+                                      int down_type, int act_type) {
+    (void)vctx; (void)out; (void)gate_buf; (void)up_buf; (void)down_buf;
+    (void)X; (void)n_tokens; (void)dim; (void)hidden_dim;
+    (void)gate_type; (void)up_type; (void)down_type; (void)act_type;
+    return -1;
+}
+
+
+static int metal_dense_ffn_batch_norm_resid(
+        void *vctx, float *out,
+        void *gate_buf, void *up_buf,
+        void *down_buf, void *norm_buf,
+        const float *X, int n_tokens,
+        int dim, int hidden_dim,
+        int gate_type, int up_type,
+        int down_type, int act_type,
+        float norm_eps)
+{
+    BnMetalCtx *ctx = (BnMetalCtx *)vctx;
+    if (!ctx || !out || !X || !gate_buf || !down_buf || !norm_buf)
+        return -1;
+    if (n_tokens <= 1 || dim <= 0 || hidden_dim <= 0) return -1;
+    if (act_type != 0) return -1;
+    if (gate_type < 0 || gate_type >= BN_METAL_MAX_TYPES) return -1;
+    if (down_type < 0 || down_type >= BN_METAL_MAX_TYPES) return -1;
+    if (!ctx->pipelines[gate_type] || !ctx->pipelines[down_type])
+        return -1;
+    if (!ctx->ssm_prefill_rmsnorm_pipeline ||
+        !ctx->fwd_pipelines[BN_GPU_SHADER_SILU_GATE] ||
+        !ctx->fwd_pipelines[BN_GPU_SHADER_RESIDUAL_ADD])
+        return -1;
+
+    int gateup_stacked = (up_buf == NULL);
+    if (gateup_stacked && !ctx->ssm_prefill_silu_gate_stacked_pipeline)
+        return -1;
+    if (!gateup_stacked) {
+        if (up_type < 0 || up_type >= BN_METAL_MAX_TYPES) return -1;
+        if (!ctx->pipelines[up_type]) return -1;
+    }
+
+    BnMetalBuf *gate_w = (BnMetalBuf *)gate_buf;
+    BnMetalBuf *up_w   = (BnMetalBuf *)up_buf;
+    BnMetalBuf *down_w = (BnMetalBuf *)down_buf;
+    BnMetalBuf *norm_w = (BnMetalBuf *)norm_buf;
+    if (!gate_w->buf || !down_w->buf || !norm_w->buf) return -1;
+    if (!gateup_stacked && (!up_w || !up_w->buf)) return -1;
+    if (gate_w->q4_prepared || down_w->q4_prepared) return -1;
+    if (!gateup_stacked && up_w->q4_prepared) return -1;
+    if (gate_w->bias_offset || down_w->bias_offset) return -1;
+    if (!gateup_stacked && up_w->bias_offset) return -1;
+
+    size_t x_floats     = (size_t)n_tokens * (size_t)dim;
+    size_t hidden_floats = (size_t)n_tokens * (size_t)hidden_dim;
+    size_t gate_floats = gateup_stacked ? hidden_floats * 2 : hidden_floats;
+    size_t up_floats   = gateup_stacked ? 0 : hidden_floats;
+    size_t post_floats = gateup_stacked ? hidden_floats : 0;
+    size_t total = x_floats * 3 + gate_floats + up_floats + post_floats;
+    if (metal_ensure_ssm_prefill_buf(ctx, total * sizeof(float)) != 0)
+        return -1;
+    size_t off_x    = 0;
+    size_t off_norm = off_x    + x_floats;
+    size_t off_gate = off_norm + x_floats;
+    size_t off_up   = off_gate + gate_floats;
+    size_t off_post = off_up   + up_floats;
+    size_t off_down = off_post + post_floats;
+
+    float *scratch_base = (float *)[ctx->ssm_prefill_buf contents];
+    memcpy(scratch_base + off_x, X, x_floats * sizeof(float));
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        {
+            uint32_t params[8] = { (uint32_t)dim, 0, 0, 0, 0, 0, 0, 0 };
+            memcpy(&params[1], &norm_eps, sizeof(float));
+            [enc setComputePipelineState:ctx->ssm_prefill_rmsnorm_pipeline];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_x    * sizeof(float) atIndex:0];
+            [enc setBuffer:norm_w->buf offset:norm_w->offset atIndex:1];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_norm * sizeof(float) atIndex:2];
+            [enc setBytes:params length:sizeof(params) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+
+        size_t off_ffn_down_in;
+        if (gateup_stacked) {
+            metal_encode_matmul(ctx, enc, gate_w,
+                                 ctx->ssm_prefill_buf, off_norm * sizeof(float),
+                                 ctx->ssm_prefill_buf, off_gate * sizeof(float),
+                                 gate_type, hidden_dim * 2, dim, n_tokens);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            uint32_t params[8] = { (uint32_t)hidden_dim, (uint32_t)n_tokens,
+                                   0, 0, 0, 0, 0, 0 };
+            uint32_t wg_x = ((uint32_t)hidden_dim + 255u) / 256u;
+            [enc setComputePipelineState:ctx->ssm_prefill_silu_gate_stacked_pipeline];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_gate * sizeof(float) atIndex:0];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_post * sizeof(float) atIndex:1];
+            [enc setBytes:params length:sizeof(params) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(wg_x, (NSUInteger)n_tokens, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            off_ffn_down_in = off_post;
+        } else {
+            metal_encode_matmul(ctx, enc, gate_w,
+                                 ctx->ssm_prefill_buf, off_norm * sizeof(float),
+                                 ctx->ssm_prefill_buf, off_gate * sizeof(float),
+                                 gate_type, hidden_dim, dim, n_tokens);
+            metal_encode_matmul(ctx, enc, up_w,
+                                 ctx->ssm_prefill_buf, off_norm * sizeof(float),
+                                 ctx->ssm_prefill_buf, off_up * sizeof(float),
+                                 up_type, hidden_dim, dim, n_tokens);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            uint32_t total_e = (uint32_t)hidden_floats;
+            uint32_t params[8] = { total_e, 0, 0, 0, 0, 0, 0, 0 };
+            uint32_t wg_x = (total_e + 255u) / 256u;
+            [enc setComputePipelineState:ctx->fwd_pipelines[BN_GPU_SHADER_SILU_GATE]];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_gate * sizeof(float) atIndex:0];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_up   * sizeof(float) atIndex:1];
+            [enc setBytes:params length:sizeof(params) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(wg_x, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            off_ffn_down_in = off_gate;
+        }
+
+        metal_encode_matmul(ctx, enc, down_w,
+                             ctx->ssm_prefill_buf, off_ffn_down_in * sizeof(float),
+                             ctx->ssm_prefill_buf, off_down * sizeof(float),
+                             down_type, dim, hidden_dim, n_tokens);
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        {
+            uint32_t total_e = (uint32_t)x_floats;
+            uint32_t params[8] = { total_e, 0, 0, 0, 0, 0, 0, 0 };
+            uint32_t wg_x = (total_e + 255u) / 256u;
+            [enc setComputePipelineState:ctx->fwd_pipelines[BN_GPU_SHADER_RESIDUAL_ADD]];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_down * sizeof(float) atIndex:0];
+            [enc setBuffer:ctx->ssm_prefill_buf offset:off_x    * sizeof(float) atIndex:1];
+            [enc setBytes:params length:sizeof(params) atIndex:2];
+            [enc dispatchThreadgroups:MTLSizeMake(wg_x, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+    }
+
+    memcpy(out, scratch_base + off_down, x_floats * sizeof(float));
     return 0;
 }
 
@@ -1929,6 +3557,18 @@ static int metal_execute(void *vctx, const void *ops_raw, int n_ops,
                 [enc setBytes:params length:sizeof(params) atIndex:4];
                 break;
             }
+            case BN_GPU_SHADER_Q5K_MATVEC_SPLIT: {
+                BnMetalBuf *wbuf = (BnMetalBuf *)op->W_buf;
+                if (!wbuf) continue;
+                int out2_slot = (op->p[3] > 0u) ? op->rows : op->buf_aux;
+                [enc setBuffer:wbuf->buf offset:wbuf->offset atIndex:0];
+                [enc setBuffer:ctx->act_bufs[op->buf_in] offset:0 atIndex:1];
+                [enc setBuffer:ctx->act_bufs[op->buf_out] offset:0 atIndex:2];
+                [enc setBuffer:ctx->act_bufs[op->buf_aux] offset:0 atIndex:3];
+                [enc setBuffer:ctx->act_bufs[out2_slot] offset:0 atIndex:4];
+                [enc setBytes:params length:sizeof(params) atIndex:5];
+                break;
+            }
             default: continue;
             }
 
@@ -2021,6 +3661,7 @@ static int metal_execute(void *vctx, const void *ops_raw, int n_ops,
                 wg_x = (op->p[2] + tile_rows - 1) / tile_rows;
                 break;
             case BN_GPU_SHADER_Q4K_MATVEC_SPLIT:
+            case BN_GPU_SHADER_Q5K_MATVEC_SPLIT:
                 wg_x = (op->p[0] + 31) / 32;  // total_rows / 32
                 break;
             }
@@ -2281,7 +3922,19 @@ BnGPUBackend *bn_gpu_metal_create(const char *shader_dir)
         gpu->buffer_destroy       = metal_buffer_destroy;
         gpu->matvec               = metal_matvec;
         gpu->matmul               = metal_matmul;
+        gpu->matmul_batch         = metal_matmul_batch;
         gpu->matvec_batch         = metal_matvec_batch;
+        gpu->dense_ffn            = metal_dense_ffn;
+        gpu->kv_cache_init        = metal_kv_cache_init;
+        gpu->kv_cache_write       = metal_kv_cache_write;
+        gpu->prefill_kv_prep      = metal_prefill_kv_prep;
+        gpu->prefill_begin_batch  = metal_prefill_begin_batch;
+        gpu->prefill_flush        = metal_prefill_flush;
+        gpu->prefill_ssm_layer    = metal_prefill_ssm_layer;
+        gpu->prefill_attention    = metal_prefill_attention;
+        gpu->prefill_attention_wo = metal_prefill_attention_wo;
+        gpu->dense_ffn_batch         = metal_dense_ffn_batch_stub;
+        gpu->dense_ffn_batch_norm_resid = metal_dense_ffn_batch_norm_resid;
         gpu->execute              = metal_execute;
         gpu->init_activations     = metal_init_activations;
         gpu->free_activations     = metal_free_activations;
@@ -2312,6 +3965,7 @@ void bn_gpu_metal_destroy(BnGPUBackend *gpu)
 
         ctx->x_buf = nil;
         ctx->out_buf = nil;
+        ctx->ssm_prefill_buf = nil;
 
         /* Release slab */
         ctx->slab_buf = nil;

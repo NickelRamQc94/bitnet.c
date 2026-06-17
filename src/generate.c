@@ -58,6 +58,8 @@ static int use_gpu_batch_prefill(const BnModel *model) {
             !getenv("BN_CUDA_DISABLE_PREFILL_HYBRID_CHAIN") &&
             !getenv("BN_CUDA_DISABLE_PREFILL_SSM_LAYER"))
             return 1;
+        if (gpu && gpu->kind == BN_GPU_BACKEND_METAL)
+            return 1;
         return 0;
     }
     if (gpu && gpu->kind == BN_GPU_BACKEND_CUDA && c->n_experts > 0)
@@ -188,7 +190,7 @@ int bn_generate(BnModel *model, BnSession *s, BnTokenizer *tok, BnSampler *sampl
         }
 
         if (next == tok->eot_id || next == tok->eos_id ||
-            next == tok->im_end_id)
+            next == tok->im_end_id || next == tok->endoftext_id)
             break;
 
         // Ring buffer loop detection
@@ -295,7 +297,8 @@ int bn_generate_speculative(
         int k_actual = 0;
         for (int i = 0; i < draft_k && gen_count + i < max_tokens; i++) {
             int d = bn_sampler_sample(sampler, draft_logits);
-            if (d == tok->eot_id || d == tok->eos_id || d == tok->im_end_id)
+            if (d == tok->eot_id || d == tok->eos_id || d == tok->im_end_id ||
+                d == tok->endoftext_id)
                 break;
             draft_tokens[k_actual++] = d;
             draft_logits = bn_transformer_forward(draft, ds, d, *pos + k_actual - 1);
@@ -304,7 +307,8 @@ int bn_generate_speculative(
 
         if (k_actual == 0) {
             int t = bn_sampler_sample(sampler, target_logits);
-            if (t == tok->eot_id || t == tok->eos_id || t == tok->im_end_id)
+            if (t == tok->eot_id || t == tok->eos_id || t == tok->im_end_id ||
+                t == tok->endoftext_id)
                 break;
             bn_sampler_accept(sampler, t);
             const char *piece = bn_tokenizer_decode(tok, t);
@@ -358,7 +362,8 @@ int bn_generate_speculative(
 
         if (corrected >= 0) {
             if (corrected != tok->eot_id && corrected != tok->eos_id &&
-                corrected != tok->im_end_id) {
+                corrected != tok->im_end_id &&
+                corrected != tok->endoftext_id) {
                 bn_sampler_accept(sampler, corrected);
                 const char *piece = bn_tokenizer_decode(tok, corrected);
                 if (piece && cb && cb(piece, corrected, user_data)) goto done;
@@ -377,7 +382,7 @@ int bn_generate_speculative(
             *pos += n_accepted;
             int bonus = bn_sampler_sample(sampler, target_logits);
             if (bonus != tok->eot_id && bonus != tok->eos_id &&
-                bonus != tok->im_end_id) {
+                bonus != tok->im_end_id && bonus != tok->endoftext_id) {
                 bn_sampler_accept(sampler, bonus);
                 const char *piece = bn_tokenizer_decode(tok, bonus);
                 if (piece && cb && cb(piece, bonus, user_data)) goto done;
@@ -418,9 +423,15 @@ float *bn_prefill(BnModel *model, BnSession *s, const int *tokens, int n_tokens,
             bn_transformer_gpu_upload_kv_cache(model, s, pos0,
                                                n_tokens) != 0)
             return NULL;
-        if (logits && gpu_attached &&
+        BnGPUBackend *prefill_gpu = bn_model_gpu(model);
+        int needs_ssm_upload =
+            logits && gpu_attached &&
             model->config.full_attn_interval > 0 &&
-            getenv("BN_CUDA_DISABLE_PREFILL_SSM_LAYER") &&
+            !s->gpu_ssm_direct_valid &&
+            prefill_gpu &&
+            (prefill_gpu->kind == BN_GPU_BACKEND_METAL ||
+             prefill_gpu->kind == BN_GPU_BACKEND_WEBGPU);
+        if (needs_ssm_upload &&
             bn_transformer_gpu_upload_ssm_state(model, s) != 0)
             return NULL;
     } else {
@@ -446,9 +457,15 @@ int bn_prefill_no_logits(BnModel *model, BnSession *s, const int *tokens,
         if (rc == 0 && gpu_attached && !s->gpu_kv_direct_valid)
             rc = bn_transformer_gpu_upload_kv_cache(model, s, pos0,
                                                     n_tokens);
-        if (rc == 0 && gpu_attached &&
+        BnGPUBackend *prefill_gpu = bn_model_gpu(model);
+        int needs_ssm_upload =
+            rc == 0 && gpu_attached &&
             model->config.full_attn_interval > 0 &&
-            getenv("BN_CUDA_DISABLE_PREFILL_SSM_LAYER"))
+            !s->gpu_ssm_direct_valid &&
+            prefill_gpu &&
+            (prefill_gpu->kind == BN_GPU_BACKEND_METAL ||
+             prefill_gpu->kind == BN_GPU_BACKEND_WEBGPU);
+        if (needs_ssm_upload)
             rc = bn_transformer_gpu_upload_ssm_state(model, s);
         return rc;
     }

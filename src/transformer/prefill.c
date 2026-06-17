@@ -154,11 +154,11 @@ static float *prefill_decode_tokens(BnModel *m, BnSession *sess,
     return sess->state.x;
 }
 
+#ifdef __AVX2__
 static int prefill_force_float_kquant(const BnModel *m) {
     return m && (m->config.arch_flags & BN_MODEL_ARCH_FLAG_QWEN3);
 }
 
-#ifdef __AVX2__
 static int prefill_qweight_is_kquant(const BnQWeight *w) {
     return w && (w->type == BN_GGUF_TENSOR_Q4_K ||
                  w->type == BN_GGUF_TENSOR_Q5_K ||
@@ -1356,24 +1356,43 @@ static void prefill_fill_rope(float *rope_cos_buf, float *rope_sin_buf,
     }
 }
 
-static int prefill_prepare_q_for_gpu_attention(BnBatchedAttnCtx *b) {
-    if (!b || b->q_gated || !b->Q_buf || !b->rope_cos || !b->rope_sin)
+static int prefill_prepare_q_for_gpu_attention(BnBatchedAttnCtx *b,
+                                               float *gate_out) {
+    if (!b || !b->Q_buf || !b->rope_cos || !b->rope_sin)
         return -1;
-    if (b->pos0 != 0)
+    if (b->pos0 < 0 || b->pos0 > b->seq_len)
         return -1;
     int head_size = b->head_size;
     int n_heads = b->n_heads;
     int n_tokens = b->n_tokens;
     int q_row_stride = b->q_row_stride > 0 ? b->q_row_stride : b->wq_rows;
     int rope_stride = b->rope_stride > 0 ? b->rope_stride : b->rope_dims / 2;
+    int q_gated = b->q_gated;
+    int q_stride = q_gated ? 2 * head_size : head_size;
     if (head_size <= 0 || n_heads <= 0 || n_tokens <= 1 ||
-        q_row_stride < n_heads * head_size)
+        q_row_stride < n_heads * q_stride)
+        return -1;
+    if (q_gated && !gate_out)
         return -1;
 
+    int dense_row = n_heads * head_size;
     for (int t = 0; t < n_tokens; t++) {
         float *row = b->Q_buf + (size_t)t * q_row_stride;
+        if (q_gated) {
+            float *dst_q    = b->Q_buf + (size_t)t * dense_row;
+            float *dst_gate = gate_out + (size_t)t * dense_row;
+            for (int h = 0; h < n_heads; h++) {
+                float *src_q    = row + h * q_stride;
+                float *src_gate = src_q + head_size;
+                memmove(dst_gate + h * head_size, src_gate,
+                        (size_t)head_size * sizeof(float));
+                memmove(dst_q    + h * head_size, src_q,
+                        (size_t)head_size * sizeof(float));
+            }
+            row = dst_q;
+        }
         if (b->q_bias) {
-            for (int i = 0; i < n_heads * head_size; i++)
+            for (int i = 0; i < dense_row; i++)
                 row[i] += b->q_bias[i];
         }
         if (b->q_norm) {
@@ -1387,9 +1406,9 @@ static int prefill_prepare_q_for_gpu_attention(BnBatchedAttnCtx *b) {
             row, n_heads, head_size, b->rope_dims,
             b->rope_cos + (size_t)t * rope_stride,
             b->rope_sin + (size_t)t * rope_stride);
-        if (q_row_stride != n_heads * head_size)
-            memmove(b->Q_buf + (size_t)t * n_heads * head_size, row,
-                    (size_t)n_heads * (size_t)head_size * sizeof(float));
+        if (!q_gated && q_row_stride != dense_row)
+            memmove(b->Q_buf + (size_t)t * dense_row, row,
+                    (size_t)dense_row * sizeof(float));
     }
     return 0;
 }
@@ -1457,7 +1476,10 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                int n_tokens, int pos0, float *all_logits,
                                int need_last_logits) {
     if (n_tokens <= 0) return NULL;
-    if (sess) sess->gpu_kv_direct_valid = 0;
+    if (sess) {
+        sess->gpu_kv_direct_valid = 0;
+        sess->gpu_ssm_direct_valid = 0;
+    }
     if (n_tokens == 1) {
         float *logits = bn_transformer_forward(m, sess, tokens[0], pos0);
         return need_last_logits ? logits : (logits ? sess->state.x : NULL);
@@ -1518,8 +1540,11 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
         return prefill_decode_tokens(m, sess, tokens, n_tokens, pos0,
                                      all_logits, need_last_logits);
     }
+    int metal_hybrid_prefill =
+        c->full_attn_interval > 0 && c->ssm_inner_size > 0 &&
+        prefill_gpu && prefill_gpu->kind == BN_GPU_BACKEND_METAL;
     if (c->full_attn_interval > 0 && c->ssm_inner_size > 0 &&
-        !cuda_hybrid_prefill && !getenv("BN_PREFILL_ALLOW_HYBRID_BATCH")) {
+        !cuda_hybrid_prefill && !metal_hybrid_prefill) {
         float *logits = NULL;
         for (int t = 0; t < n_tokens; t++) {
             logits = bn_transformer_forward(m, sess, tokens[t], pos0 + t);
@@ -1572,9 +1597,13 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                         + nt * (size_t)xb2_stride
                         + nt * (size_t)hb_stride
                         + nt * (size_t)hb2_stride;
+    size_t gate_floats_per_layer =
+        (size_t)nt * (size_t)c->n_heads * (size_t)head_size;
     size_t arena_size = act_elems * sizeof(float)
                       + batch_floats * sizeof(float)
                       + nt * half_rope * 2 * sizeof(float)
+                      + gate_floats_per_layer * sizeof(float) *
+                        (size_t)(c->n_layers + 1)
                       + 512;
 #ifdef __AVX2__
     int n_bpr_pf = (dim % BN_QK_K == 0) ? dim / BN_QK_K : 0;
@@ -2101,7 +2130,6 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                         float *v_t = V_new + (size_t)t * layer_kv_dim;
                         float *rc = rope_cos_buf + t * half_rope;
                         float *rs = rope_sin_buf + t * half_rope;
-
                         if (lw->attn.k_bias)
                             for (int i = 0; i < layer_kv_dim; i++) k_t[i] += lw->attn.k_bias[i];
                         if (lw->attn.v_bias)
@@ -2142,6 +2170,19 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                     }
                 }
 
+                if (!c->kv_f16 && gpu && gpu->kv_cache_init &&
+                    gpu->kv_cache_write) {
+                    int n_attn = (c->full_attn_interval > 0)
+                        ? c->n_layers / c->full_attn_interval : c->n_layers;
+                    if (gpu->kv_cache_init(gpu->ctx, n_attn, c->seq_len,
+                                            kv_dim) == 0) {
+                        int cache_pos0 = pos0 % c->seq_len;
+                        gpu->kv_cache_write(gpu->ctx, plan.attn_idx,
+                                             cache_pos0, K_new, V_new,
+                                             n_tokens, kv_dim);
+                    }
+                }
+
                 // Phase 2: batched attention (Q processing + attention, parallel over heads)
                 BnBatchedAttnCtx bctx = {
                     .c = c, .s = s,
@@ -2167,11 +2208,20 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                 };
                 t_prof = prefill_profile_now(&prof);
                 int used_gpu_attn = used_raw_prefill_attn_wo;
+                float *gate_scratch = NULL;
+                size_t gate_floats =
+                    q_gated ? (size_t)n_tokens * (size_t)c->n_heads *
+                              (size_t)layer_head_size : 0;
+                if (q_gated)
+                    gate_scratch = (float *)sh_arena_alloc(
+                        pf_arena, gate_floats * sizeof(float));
                 if (!used_raw_prefill_attn_wo &&
                     gpu && gpu->prefill_attention &&
                     !getenv("BN_CUDA_DISABLE_PREFILL_ATTN") &&
+                    !c->kv_f16 &&
+                    (!q_gated || gate_scratch) &&
                     n_tokens >= prefill_gpu_attention_min_tokens() &&
-                    prefill_prepare_q_for_gpu_attention(&bctx) == 0) {
+                    prefill_prepare_q_for_gpu_attention(&bctx, gate_scratch) == 0) {
                     void *wo_buf = prefill_backend_role_or_qweight(
                         backend, l, BN_BACKEND_HANDLE_WO_PREFILL,
                         &lw->attn.wo);
@@ -2185,15 +2235,29 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                             layer_head_size, layer_kv_mul, kv_dim,
                             lw->attn.wo.rows, lw->attn.wo.cols,
                             lw->attn.wo.type,
-                            prefill_attention_scale(c, layer_head_size)) == 0) {
+                            prefill_attention_scale(c, layer_head_size),
+                            pos0, c->seq_len,
+                            s->key_cache, s->value_cache, loff,
+                            q_gated ? gate_scratch : NULL) == 0) {
                         used_gpu_attn = 1;
                         used_fused_attn_wo = 1;
                     } else if (gpu->prefill_attention(
                             gpu->ctx, Q_buf, Q_buf, K_new, V_new, n_tokens,
                             c->n_heads, layer_n_kv_heads, layer_head_size,
                             layer_kv_mul, kv_dim,
-                            prefill_attention_scale(c, layer_head_size)) == 0) {
+                            prefill_attention_scale(c, layer_head_size),
+                            pos0, c->seq_len,
+                            s->key_cache, s->value_cache, loff) == 0) {
                         used_gpu_attn = 1;
+                        if (q_gated && gate_scratch) {
+                            size_t total = (size_t)n_tokens *
+                                           (size_t)c->n_heads *
+                                           (size_t)layer_head_size;
+                            for (size_t i = 0; i < total; i++) {
+                                float g = gate_scratch[i];
+                                Q_buf[i] *= 1.0f / (1.0f + expf(-g));
+                            }
+                        }
                     } else {
                         sh_arena_free(pf_arena);
                         return NULL;
@@ -2390,6 +2454,54 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                 }
             }
 
+            if (metal_hybrid_prefill && prefill_gpu &&
+                prefill_gpu->prefill_begin_batch &&
+                prefill_gpu->prefill_flush &&
+                prefill_gpu->prefill_ssm_layer &&
+                !lw->moe.router_weight) {
+                int run_end = l + 1;
+                while (run_end < c->n_layers) {
+                    BnLayerWeights *rlw = &w->layers[run_end];
+                    BnLayerShapePlan rplan;
+                    bn_transformer_plan_layer_shape(
+                        &rplan, c, rlw, run_end,
+                        bn_model_tq_state(m) != NULL);
+                    if (rplan.is_attn || rlw->moe.router_weight)
+                        break;
+                    run_end++;
+                }
+                if (run_end - l > 1 &&
+                    prefill_gpu->prefill_begin_batch(
+                        prefill_gpu->ctx, act, n_tokens, dim) == 0) {
+                    int batch_ok = 1;
+                    for (int rl = l; rl < run_end; rl++) {
+                        BnLayerWeights *rlw = &w->layers[rl];
+                        BnLayerShapePlan rplan;
+                        bn_transformer_plan_layer_shape(
+                            &rplan, c, rlw, rl,
+                            bn_model_tq_state(m) != NULL);
+                        int r_did_ffn = 0;
+                        if (prefill_ssm_layer_gpu(
+                                m, act, rlw, act, n_tokens, dim,
+                                qkv_dim_ssm, value_dim, num_k_heads,
+                                head_k_dim, num_v_heads, head_v_dim,
+                                kern_ssm, rplan.ssm_idx, rl, 1,
+                                c->norm_eps, &r_did_ffn) != 0 ||
+                            !r_did_ffn) {
+                            batch_ok = 0;
+                            break;
+                        }
+                    }
+                    prefill_gpu->prefill_flush(prefill_gpu->ctx, act,
+                                               n_tokens, dim);
+                    if (batch_ok) {
+                        sess->gpu_ssm_direct_valid = 1;
+                        l = run_end - 1;
+                        goto prefill_layer_done;
+                    }
+                }
+            }
+
             size_t state_per_layer = (size_t)num_v_heads * head_k_dim * head_v_dim;
             float *ssm_state = s->ssm_state + (size_t)ssm_idx * state_per_layer;
             size_t conv_per_layer = (size_t)(kern_ssm - 1) * qkv_dim_ssm;
@@ -2402,6 +2514,7 @@ static float *prefill_internal(BnModel *m, BnSession *sess, const int *tokens,
                                       kern_ssm, ssm_idx, l,
                                       n_tokens >= prefill_moe_chain_min_tokens(c, bn_model_gpu(m)),
                                       c->norm_eps, &ssm_did_ffn) == 0) {
+                sess->gpu_ssm_direct_valid = 1;
                 if (ssm_did_ffn)
                     goto prefill_layer_done;
                 goto prefill_ssm_done;

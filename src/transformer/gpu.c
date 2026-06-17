@@ -1398,9 +1398,15 @@ static float *bn_transformer_gpu_forward_impl(BnModel *m, BnSession *sess,
 
         // ---- SSM layer ----
         if (!is_attn) {
+            int gpu_ssm_supported =
+                (gpu->kind == BN_GPU_BACKEND_CUDA ||
+                 gpu->kind == BN_GPU_BACKEND_METAL);
+            const char *disable_env =
+                gpu->kind == BN_GPU_BACKEND_CUDA
+                    ? "BN_CUDA_DISABLE_SSM_GRAPH"
+                    : "BN_METAL_DISABLE_SSM_GRAPH";
             int use_cpu_ssm_fallback =
-                gpu->kind != BN_GPU_BACKEND_CUDA ||
-                getenv("BN_CUDA_DISABLE_SSM_GRAPH") != NULL;
+                !gpu_ssm_supported || getenv(disable_env) != NULL;
             if (use_cpu_ssm_fallback) {
                 void *nn = bn_transformer_gpu_resolve_next_norm(
                     backend, l, c->n_layers, output_norm);

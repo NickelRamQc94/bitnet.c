@@ -238,14 +238,15 @@ struct BnGPUBackend {
     // out[n_tokens, n_heads * head_size] =
     // attention(Q[n_tokens, n_heads * head_size],
     //           K/V[n_tokens, n_kv_heads * head_size]).
-    // Q and K must already include bias, norm, and RoPE. This prompt helper
-    // handles only the current prompt window, so callers should use it only
-    // when pos0 == 0 unless the backend documents broader cache support.
+    // Q and K must already include bias, norm, and RoPE.
     int (*prefill_attention)(void *ctx, float *out,
                              const float *Q, const float *K, const float *V,
                              int n_tokens, int n_heads, int n_kv_heads,
                              int head_size, int kv_mul, int kv_dim,
-                             float attention_scale);
+                             float attention_scale,
+                             int pos0, int seq_len,
+                             const float *key_cache,
+                             const float *value_cache, size_t loff);
 
     // Fused prompt attention + output projection. Optional; backends may keep
     // the attention intermediate resident before applying W_wo.
@@ -255,7 +256,11 @@ struct BnGPUBackend {
                                 int n_heads, int n_kv_heads, int head_size,
                                 int kv_mul, int kv_dim, int wo_rows,
                                 int wo_cols, int wo_type,
-                                float attention_scale);
+                                float attention_scale,
+                                int pos0, int seq_len,
+                                const float *key_cache,
+                                const float *value_cache, size_t loff,
+                                const float *gate);
 
     // Fused prompt QK/WV matmul + Q/K norm/RoPE + attention + W_O.
     // Optional CUDA-oriented fast path. Writes processed K/V rows back to
@@ -379,6 +384,25 @@ struct BnGPUBackend {
                                     float attention_scale,
                                     int norm_topk_prob,
                                     float expert_weights_scale);
+
+    int (*kv_cache_init)(void *ctx, int n_layers, int seq_len, int kv_dim);
+
+    int (*kv_cache_write)(void *ctx, int layer_idx, int pos,
+                          const float *k_host, const float *v_host,
+                          int n_tokens, int kv_dim);
+
+    int (*prefill_kv_prep)(void *ctx, float *K, float *V,
+                           const float *k_bias, const float *v_bias,
+                           const float *k_norm_w,
+                           const float *rope_cos, const float *rope_sin,
+                           int n_tokens, int n_kv_heads, int head_size,
+                           int rope_dims, int qk_norm_per_head,
+                           float norm_eps);
+
+    int (*prefill_begin_batch)(void *ctx, const float *X,
+                               int n_tokens, int dim);
+
+    int (*prefill_flush)(void *ctx, float *out, int n_tokens, int dim);
 
     // Hybrid/SSM prompt block fast path:
     // out[n_tokens, dim] = X + ssm_out(SSM(norm(X))). Backend owns and updates

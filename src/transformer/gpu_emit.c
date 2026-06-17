@@ -968,6 +968,23 @@ int bn_transformer_gpu_upload_kv_cache(BnModel *m, BnSession *sess,
     return 0;
 }
 
+static int gpu_ssm_state_transpose(float *out, const float *in,
+                                   int n_ssm, int num_v_heads,
+                                   int head_v_dim, int head_k_dim) {
+    size_t per_head = (size_t)head_v_dim * (size_t)head_k_dim;
+    for (int l = 0; l < n_ssm; l++) {
+        for (int h = 0; h < num_v_heads; h++) {
+            const float *src = in + ((size_t)l * num_v_heads + h) * per_head;
+            float *dst = out + ((size_t)l * num_v_heads + h) * per_head;
+            for (int v = 0; v < head_v_dim; v++)
+                for (int k = 0; k < head_k_dim; k++)
+                    dst[(size_t)k * head_v_dim + v] =
+                        src[(size_t)v * head_k_dim + k];
+        }
+    }
+    return 0;
+}
+
 int bn_transformer_gpu_upload_ssm_state(BnModel *m, BnSession *sess) {
     if (!m || !sess) return -1;
     BnGPUBackend *gpu = bn_model_gpu(m);
@@ -992,9 +1009,14 @@ int bn_transformer_gpu_upload_ssm_state(BnModel *m, BnSession *sess) {
 
     size_t state_values = (size_t)n_ssm * (size_t)num_v_heads *
                           (size_t)head_k_dim * (size_t)head_v_dim;
+    float *transposed = (float *)malloc(state_values * sizeof(float));
+    if (!transposed) return -1;
+    gpu_ssm_state_transpose(transposed, s->ssm_state, n_ssm, num_v_heads,
+                            head_v_dim, head_k_dim);
     int rc = gpu->write_activation(gpu->ctx, BN_GPU_VALUE_SSM_STATE,
-                                   s->ssm_state,
+                                   transposed,
                                    state_values * sizeof(float), 0);
+    free(transposed);
     if (rc != 0) return -1;
 
     size_t conv_values = (size_t)n_ssm * (size_t)(kern - 1) *
@@ -1002,6 +1024,60 @@ int bn_transformer_gpu_upload_ssm_state(BnModel *m, BnSession *sess) {
     return gpu->write_activation(gpu->ctx, BN_GPU_VALUE_SSM_CONV_STATE,
                                  s->ssm_conv_state,
                                  conv_values * sizeof(float), 0);
+}
+
+int bn_transformer_gpu_download_ssm_state(BnModel *m, BnSession *sess) {
+    if (!m || !sess) return -1;
+    BnGPUBackend *gpu = bn_model_gpu(m);
+    if (!gpu || !gpu->read_activation) return -1;
+    BnConfig *c = &m->config;
+    BnRunState *s = &sess->state;
+    if (c->full_attn_interval <= 0 || c->ssm_inner_size <= 0)
+        return 0;
+    if (!s->ssm_state || !s->ssm_conv_state) return -1;
+
+    int n_attn = c->n_layers / c->full_attn_interval;
+    int n_ssm = c->n_layers - n_attn;
+    int num_v_heads = c->ssm_time_step_rank;
+    int head_k_dim = c->ssm_state_size;
+    if (n_ssm <= 0 || num_v_heads <= 0 || head_k_dim <= 0)
+        return -1;
+    int head_v_dim = c->ssm_inner_size / num_v_heads;
+    int qkv_dim = c->ssm_group_count * head_k_dim * 2 + c->ssm_inner_size;
+    int kern = c->ssm_conv_kernel > 0 ? c->ssm_conv_kernel : 4;
+    if (head_v_dim <= 0 || qkv_dim <= 0 || kern <= 1)
+        return -1;
+
+    size_t state_values = (size_t)n_ssm * (size_t)num_v_heads *
+                          (size_t)head_k_dim * (size_t)head_v_dim;
+    float *staging = (float *)malloc(state_values * sizeof(float));
+    if (!staging) return -1;
+    int rc = gpu->read_activation(gpu->ctx, BN_GPU_VALUE_SSM_STATE,
+                                  staging,
+                                  state_values * sizeof(float), 0);
+    if (rc != 0) { free(staging); return -1; }
+    {
+        size_t per_head = (size_t)head_v_dim * (size_t)head_k_dim;
+        for (int l = 0; l < n_ssm; l++) {
+            for (int h = 0; h < num_v_heads; h++) {
+                const float *src = staging +
+                    ((size_t)l * num_v_heads + h) * per_head;
+                float *dst = s->ssm_state +
+                    ((size_t)l * num_v_heads + h) * per_head;
+                for (int k = 0; k < head_k_dim; k++)
+                    for (int v = 0; v < head_v_dim; v++)
+                        dst[(size_t)v * head_k_dim + k] =
+                            src[(size_t)k * head_v_dim + v];
+            }
+        }
+    }
+    free(staging);
+
+    size_t conv_values = (size_t)n_ssm * (size_t)(kern - 1) *
+                         (size_t)qkv_dim;
+    return gpu->read_activation(gpu->ctx, BN_GPU_VALUE_SSM_CONV_STATE,
+                                s->ssm_conv_state,
+                                conv_values * sizeof(float), 0);
 }
 
 void bn_transformer_gpu_emit_context_dense_ffn(
